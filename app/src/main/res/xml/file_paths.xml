@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 路径配置：允许分享应用内部缓存和文件目录的文件 -->
+<paths>
+    <files-path
+        name="imported_files"
+        path="imported/" />
+    <files-path
+        name="shared_files"
+        path="shared/" />
+</paths>

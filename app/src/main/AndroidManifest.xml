@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    MarkFlow AndroidManifest.xml
+    声明应用权限、组件与文件访问能力
+    兼容 Android 10 (API 29) 至 Android 14+ (API 35) 的分区存储
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ==================== 存储权限 ==================== -->
+    <!-- 读取外部存储：用于扫描和打开已有 .md 文件 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- 写入外部存储：Android 10 及以下需要，11+ 使用 MediaStore 无需此权限 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"
+        tools:ignore="ScopedStorage" />
+
+    <!-- Android 11+ 管理所有文件权限（作为备选方案，运行时动态请求） -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- ==================== 应用特性声明 ==================== -->
+    <uses-feature
+        android:name="android.hardware.faketouch"
+        android:required="false" />
+
+    <!-- ==================== 文件访问能力 ==================== -->
+    <!-- 声明本应用可以打开 .md / .markdown / .txt 文件 -->
+    <application
+        android:name=".MarkFlowApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MarkFlow"
+        android:requestLegacyExternalStorage="true"
+        tools:targetApi="35">
+
+        <!-- 主 Activity：单任务模式，避免多实例 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustNothing"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+
+            <!-- 启动入口 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 支持从文件管理器或其他应用打开文本类文件 -->
+            <!--
+                注意：pathPattern 不兼容 content:// 协议（现代 Android 的默认协议）。
+                这里仅使用 mimeType 匹配，让系统根据文件扩展名自动匹配。
+                text/* 覆盖 .md, .txt, .py, .sh, .java, .kt, .cpp, .css 等常见文本文件
+                application/json 覆盖 .json
+                application/octet-stream 作为兜底，覆盖 .toml 等无标准 MIME 的文件
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/json" />
+                <data android:mimeType="application/xml" />
+                <data android:mimeType="text/xml" />
+                <data android:mimeType="application/x-sh" />
+                <data android:mimeType="application/x-shellscript" />
+                <data android:mimeType="application/x-python" />
+                <data android:mimeType="application/x-yaml" />
+                <data android:mimeType="application/x-httpd-php" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+
+            <!-- 支持编辑文本类文件 -->
+            <intent-filter>
+                <action android:name="android.intent.action.EDIT" />
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/json" />
+                <data android:mimeType="application/xml" />
+                <data android:mimeType="text/xml" />
+                <data android:mimeType="application/x-sh" />
+                <data android:mimeType="application/x-shellscript" />
+                <data android:mimeType="application/x-python" />
+                <data android:mimeType="application/x-yaml" />
+                <data android:mimeType="application/x-httpd-php" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+
+            <!-- 兜底：处理无标准 MIME 类型的文件（如 .toml, .ini, .cfg 等） -->
+            <!--
+                当系统无法根据文件扩展名确定 MIME 类型时（如 .toml 无标准 MIME），
+                微信等 App 发出的 Intent 不带 mimeType，需要单独匹配。
+                同时覆盖 content:// 和 file:// 两种 scheme，确保兼容不同应用的文件传递方式。
+
+                参考 Markor 的 pathPattern 策略，为无标准 MIME 的扩展名添加路径模式匹配。
+                pathPattern 仅匹配第一个 . 之前的模式，因此需要多层深度覆盖。
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+
+                <!-- toml / ini / cfg / conf / env / properties -->
+                <data android:pathPattern=".*\.toml" />
+                <data android:pathPattern=".*\.ini" />
+                <data android:pathPattern=".*\.cfg" />
+                <data android:pathPattern=".*\.conf" />
+                <data android:pathPattern=".*\.env" />
+                <data android:pathPattern=".*\.properties" />
+                <data android:pathPattern=".*\.yaml" />
+                <data android:pathPattern=".*\.yml" />
+                <!-- csv / diff / patch / log -->
+                <data android:pathPattern=".*\.csv" />
+                <data android:pathPattern=".*\.diff" />
+                <data android:pathPattern=".*\.patch" />
+                <data android:pathPattern=".*\.log" />
+                <!-- sh / bash / zsh / dockerfile -->
+                <data android:pathPattern=".*\.sh" />
+                <data android:pathPattern=".*\.bash" />
+                <data android:pathPattern=".*\.zsh" />
+                <data android:pathPattern=".*\.dockerfile" />
+                <!-- 二级深度：a.b.toml 等 -->
+                <data android:pathPattern=".*\..*\.toml" />
+                <data android:pathPattern=".*\..*\.ini" />
+                <data android:pathPattern=".*\..*\.cfg" />
+                <data android:pathPattern=".*\..*\.yaml" />
+                <data android:pathPattern=".*\..*\.yml" />
+                <data android:pathPattern=".*\..*\.sh" />
+                <data android:pathPattern=".*\..*\.diff" />
+                <data android:pathPattern=".*\..*\.patch" />
+                <!-- 三级深度 -->
+                <data android:pathPattern=".*\..*\..*\.toml" />
+                <data android:pathPattern=".*\..*\..*\.yaml" />
+                <data android:pathPattern=".*\..*\..*\.yml" />
+                <data android:pathPattern=".*\..*\..*\.sh" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.EDIT" />
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+
+                <data android:pathPattern=".*\.toml" />
+                <data android:pathPattern=".*\.ini" />
+                <data android:pathPattern=".*\.cfg" />
+                <data android:pathPattern=".*\.conf" />
+                <data android:pathPattern=".*\.env" />
+                <data android:pathPattern=".*\.properties" />
+                <data android:pathPattern=".*\.yaml" />
+                <data android:pathPattern=".*\.yml" />
+                <data android:pathPattern=".*\.csv" />
+                <data android:pathPattern=".*\.diff" />
+                <data android:pathPattern=".*\.patch" />
+                <data android:pathPattern=".*\.log" />
+                <data android:pathPattern=".*\.sh" />
+                <data android:pathPattern=".*\.bash" />
+                <data android:pathPattern=".*\.zsh" />
+                <data android:pathPattern=".*\.dockerfile" />
+                <data android:pathPattern=".*\..*\.toml" />
+                <data android:pathPattern=".*\..*\.ini" />
+                <data android:pathPattern=".*\..*\.cfg" />
+                <data android:pathPattern=".*\..*\.yaml" />
+                <data android:pathPattern=".*\..*\.yml" />
+                <data android:pathPattern=".*\..*\.sh" />
+                <data android:pathPattern=".*\..*\.diff" />
+                <data android:pathPattern=".*\..*\.patch" />
+                <data android:pathPattern=".*\..*\..*\.toml" />
+                <data android:pathPattern=".*\..*\..*\.yaml" />
+                <data android:pathPattern=".*\..*\..*\.yml" />
+                <data android:pathPattern=".*\..*\..*\.sh" />
+            </intent-filter>
+
+            <!-- 支持从其他应用分享文本到 MarkFlow -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <!-- FileProvider：用于向分享导入的文本文件 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

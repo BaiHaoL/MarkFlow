@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MarkFlow</string>
+    <string name="file_list_title">MarkFlow</string>
+    <string name="new_file_default">未命名</string>
+    <string name="save">保存</string>
+    <string name="cancel">取消</string>
+    <string name="delete">删除</string>
+    <string name="rename">重命名</string>
+    <string name="details">详细信息</string>
+    <string name="select_all">全选</string>
+    <string name="deselect_all">取消全选</string>
+    <string name="sort_by_time">按修改时间排序</string>
+    <string name="sort_by_name">按文件名排序</string>
+    <string name="tab_raw">原文</string>
+    <string name="tab_preview">预览</string>
+    <string name="tab_edit">编辑</string>
+    <string name="search_hint">搜索关键字…</string>
+    <string name="unsaved_changes">有未保存的更改，确定退出吗？</string>
+    <string name="stay">继续编辑</string>
+    <string name="discard">放弃更改</string>
+    <string name="immersive_mode">沉浸式模式</string>
+    <string name="exit_immersive">退出沉浸式</string>
+    <string name="no_files">暂无 Markdown 文件\n点击右下角 + 新建</string>
+    <string name="file_rename_hint">输入新文件名</string>
+    <string name="confirm_delete">确认删除所选文件？</string>
+    <string name="error_file_not_found">文件不存在或已被删除</string>
+    <string name="error_permission_denied">存储权限被拒绝</string>
+    <string name="error_save_failed">保存失败，请重试</string>
+</resources>

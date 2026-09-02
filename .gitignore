@@ -1,0 +1,22 @@
+keystore.properties
+markflow-release.keystore
+*.apk
+*.aab
+/build
+/app/build
+
+# Gradle 项目级缓存（构建自动生成，勿跟踪）
+.gradle/
+
+# IDE
+.idea/
+*.iml
+
+# 本地配置
+local.properties
+
+# 根目录构建日志与临时产物
+/build_log.txt
+/*.log
+*.tmp
+*.bak
