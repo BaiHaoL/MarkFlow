@@ -226,6 +226,64 @@ object MarkwonConfig {
         }
     }
 
+    // ==================== 代码区间保护 ====================
+
+    /**
+     * 找出 Markdown 中的代码区间（围栏代码块 + 行内代码）。
+     *
+     * 各类预处理（LaTeX 环境转换 / 行内公式改写 / 图片路径改写）必须跳过这些区间：
+     * 代码示例中的 `$`、`^`、`![...]()` 等序列属于代码内容本身，改写会静默篡改代码。
+     */
+    private fun findCodeRanges(markdown: String): List<IntRange> {
+        val ranges = mutableListOf<IntRange>()
+        // 1) 围栏代码块：与 MarkdownParser 一致，行首 ``` 翻转代码块状态（未闭合则到文末）
+        var inFence = false
+        var fenceStart = 0
+        var offset = 0
+        for (line in markdown.split('\n')) {
+            if (line.startsWith("```")) {
+                if (!inFence) {
+                    inFence = true
+                    fenceStart = offset
+                } else {
+                    inFence = false
+                    ranges.add(fenceStart until (offset + line.length))
+                }
+            }
+            offset += line.length + 1 // +1 为被 split 吃掉的 \n
+        }
+        if (inFence) {
+            ranges.add(fenceStart until markdown.length)
+        }
+        // 2) 行内代码（`...`，同行、等长反引号对）：仅统计围栏之外的区间
+        val inlineRegex = Regex("(`+)([^`\\n]*?)\\1")
+        for (match in inlineRegex.findAll(markdown)) {
+            val r = match.range
+            val insideFence = ranges.any { r.first >= it.first && r.last <= it.last }
+            if (!insideFence) ranges.add(r)
+        }
+        return ranges.sortedBy { it.first }
+    }
+
+    /** 仅对代码区间之外的文本段应用 [transform]，代码区间原样保留 */
+    private inline fun transformOutsideCode(markdown: String, transform: (String) -> String): String {
+        val protectedRanges = findCodeRanges(markdown)
+        if (protectedRanges.isEmpty()) return transform(markdown)
+        val sb = StringBuilder(markdown.length)
+        var cursor = 0
+        for (range in protectedRanges) {
+            if (range.first > cursor) {
+                sb.append(transform(markdown.substring(cursor, range.first)))
+            }
+            sb.append(markdown.substring(range))
+            cursor = range.last + 1
+        }
+        if (cursor < markdown.length) {
+            sb.append(transform(markdown.substring(cursor)))
+        }
+        return sb.toString()
+    }
+
     // ==================== LaTeX 行内公式预处理 ====================
 
     /**
@@ -243,13 +301,17 @@ object MarkwonConfig {
         if (!markdown.contains("$")) return markdown
         val regex = Regex("(?<!\\$)\\$(?!\\$)([^\\$\n]+?)\\$(?!\\$)")
         return try {
-            regex.replace(markdown) { match ->
-                val content = match.groupValues[1]
-                // 仅当内容包含 LaTeX 特征字符时才转换
-                if (content.any { it in setOf('\\', '^', '_', '{', '}') }) {
-                    "\$\$${content}\$\$"
-                } else {
-                    match.value
+            // 跳过代码区间：代码示例中的 $...$ 是代码内容，不得改写
+            transformOutsideCode(markdown) { segment ->
+                if (!segment.contains("$")) return@transformOutsideCode segment
+                regex.replace(segment) { match ->
+                    val content = match.groupValues[1]
+                    // 仅当内容包含 LaTeX 特征字符时才转换
+                    if (content.any { it in setOf('\\', '^', '_', '{', '}') }) {
+                        "\$\$${content}\$\$"
+                    } else {
+                        match.value
+                    }
                 }
             }
         } catch (_: Exception) {
@@ -275,12 +337,16 @@ object MarkwonConfig {
     fun preprocessLatexEnvironments(markdown: String): String {
         if (!markdown.contains("\\begin{")) return markdown
         return try {
-            var result = markdown
-            result = convertMatrixEnv(result, "pmatrix", "(", ")")
-            result = convertMatrixEnv(result, "vmatrix", "|", "|")
-            result = convertCasesEnv(result)
-            result = convertAlignedEnv(result)
-            result
+            // 跳过代码区间：代码示例中的 \begin{...} 是代码内容，不得转换
+            transformOutsideCode(markdown) { segment ->
+                if (!segment.contains("\\begin{")) return@transformOutsideCode segment
+                var result = segment
+                result = convertMatrixEnv(result, "pmatrix", "(", ")")
+                result = convertMatrixEnv(result, "vmatrix", "|", "|")
+                result = convertCasesEnv(result)
+                result = convertAlignedEnv(result)
+                result
+            }
         } catch (_: Exception) {
             markdown
         }
@@ -379,34 +445,38 @@ object MarkwonConfig {
         val imageRegex = Regex("!\\[([^\\]]*)\\]\\(([^)]+)\\)")
         val missingPlaceholders = mutableListOf<String>()
         return try {
-            val replaced = imageRegex.replace(markdown) { matchResult ->
-                val alt = matchResult.groupValues[1]
-                val path = matchResult.groupValues[2].trim()
+            // 跳过代码区间：代码示例中的 ![...]() 是代码内容，不得改写/替换占位
+            val replaced = transformOutsideCode(markdown) { segment ->
+                if (!segment.contains("![")) return@transformOutsideCode segment
+                imageRegex.replace(segment) { matchResult ->
+                    val alt = matchResult.groupValues[1]
+                    val path = matchResult.groupValues[2].trim()
 
-                // 跳过空路径
-                if (path.isEmpty()) return@replace matchResult.value
+                    // 跳过空路径
+                    if (path.isEmpty()) return@replace matchResult.value
 
-                // 相对路径：解析为绝对路径
-                if (baseDir.isNotEmpty()) {
-                    val resolvedPath = resolveRelativeImagePath(path, baseDir)
-                    if (resolvedPath != null) {
-                        // 目标图片文件不存在 → 回退为占位文本"图片{alt}"，供预览渲染成灰色弱化
-                        if (!File(resolvedPath).exists()) {
-                            val placeholder = if (alt.isEmpty()) "图片" else "图片$alt"
-                            missingPlaceholders.add(placeholder)
-                            return@replace placeholder
+                    // 相对路径：解析为绝对路径
+                    if (baseDir.isNotEmpty()) {
+                        val resolvedPath = resolveRelativeImagePath(path, baseDir)
+                        if (resolvedPath != null) {
+                            // 目标图片文件不存在 → 回退为占位文本"图片{alt}"，供预览渲染成灰色弱化
+                            if (!File(resolvedPath).exists()) {
+                                val placeholder = if (alt.isEmpty()) "图片" else "图片$alt"
+                                missingPlaceholders.add(placeholder)
+                                return@replace placeholder
+                            }
+                            return@replace "![$alt](file://$resolvedPath)"
                         }
-                        return@replace "![$alt](file://$resolvedPath)"
                     }
-                }
 
-                // 检测不安全 URL（如 Mi Notes 的 https://com.miui.notes/...）
-                if (isUnsafeImageUrl(path)) {
-                    val displayName = extractImageName(path).ifEmpty { alt.ifEmpty { "图片" } }
-                    return@replace displayName
-                }
+                    // 检测不安全 URL（如 Mi Notes 的 https://com.miui.notes/...）
+                    if (isUnsafeImageUrl(path)) {
+                        val displayName = extractImageName(path).ifEmpty { alt.ifEmpty { "图片" } }
+                        return@replace displayName
+                    }
 
-                matchResult.value
+                    matchResult.value
+                }
             }
             ImagePreprocessResult(replaced, missingPlaceholders)
         } catch (_: Exception) {

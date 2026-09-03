@@ -119,14 +119,30 @@ class MainActivity : ComponentActivity() {
                 }
             }
             Intent.ACTION_SEND -> {
-                // 其他应用分享文本：提取文本内容，保存为临时文件
-                if (intent.type == "text/plain") {
-                    handleSharedText(intent)
+                // 优先处理文件分享（EXTRA_STREAM 携带 content:// URI），
+                // 回退到纯文本分享（EXTRA_TEXT 携带文本内容）
+                val streamUri = getStreamUriFromIntent(intent)
+                if (streamUri != null) {
+                    copyContentUriToLocal(streamUri)
                 } else {
-                    null
+                    handleSharedText(intent)
                 }
             }
             else -> null
+        }
+    }
+
+    /**
+     * 从 ACTION_SEND 的 Intent 中提取 EXTRA_STREAM（文件分享的 content:// URI）。
+     *
+     * API 33+ 需要类型化 getParcelableExtra，旧版本用非类型化版本。
+     */
+    @Suppress("DEPRECATION")
+    private fun getStreamUriFromIntent(intent: Intent): android.net.Uri? {
+        return if (android.os.Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java)
+        } else {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
         }
     }
 
@@ -136,20 +152,34 @@ class MainActivity : ComponentActivity() {
      * 解决问题：微信等应用发送的文件 URI 是临时的 content:// 链接，
      * 直接传递给编辑器可能因权限过期而无法读取。
      * 这里先将内容复制到 app 私有目录，确保后续可稳定访问。
+     *
+     * 外部传入的文件名会先经过 [sanitizeExternalFileName] 净化，防止路径穿越。
      */
     private fun copyContentUriToLocal(uri: android.net.Uri): String? {
         return try {
-            val fileName = getFileNameFromUri(uri)
-                ?: guessFileNameFromUri(uri)
+            val destDir = java.io.File(filesDir, "imported").apply { mkdirs() }
+            val rawName = getFileNameFromUri(uri) ?: guessFileNameFromUri(uri) ?: ""
+            val fileName = sanitizeExternalFileName(rawName, destDir)
                 ?: "imported_${System.currentTimeMillis()}.md"
-            val destDir = java.io.File(filesDir, "imported")
-            destDir.mkdirs()
-            val destFile = java.io.File(destDir, fileName)
+            // 同名不静默覆盖：生成 name(1).ext 形式的唯一文件名
+            val destFile = uniqueDestFile(destDir, fileName)
 
-            contentResolver.openInputStream(uri)?.use { input ->
-                destFile.outputStream().use { output ->
-                    input.copyTo(output)
+            // 先写临时文件、完成后 rename：复制中断不会留下残缺文件被列表扫出
+            val tmpFile = java.io.File(destDir, ".${destFile.name}.tmp")
+            try {
+                val input = contentResolver.openInputStream(uri) ?: return null
+                input.use { ins ->
+                    tmpFile.outputStream().use { output ->
+                        ins.copyTo(output)
+                    }
                 }
+                if (!tmpFile.renameTo(destFile)) {
+                    // rename 失败的兜底：拷贝后删除临时文件
+                    tmpFile.copyTo(destFile, overwrite = true)
+                    tmpFile.delete()
+                }
+            } finally {
+                if (tmpFile.exists()) tmpFile.delete()
             }
 
             destFile.toURI().toString()
@@ -157,6 +187,27 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "Failed to copy external file", e)
             null
         }
+    }
+
+    /**
+     * 生成不冲突的目标文件名：已存在同名文件时依次尝试 name(1).ext、name(2).ext…，
+     * 避免不同来源的同名文件互相静默覆盖。
+     */
+    private fun uniqueDestFile(dir: java.io.File, name: String): java.io.File {
+        var candidate = java.io.File(dir, name)
+        if (!candidate.exists()) return candidate
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        var i = 1
+        while (candidate.exists() && i <= 999) {
+            candidate = java.io.File(dir, "$base($i)$ext")
+            i++
+        }
+        if (candidate.exists()) {
+            candidate = java.io.File(dir, "${base}_${System.currentTimeMillis()}$ext")
+        }
+        return candidate
     }
 
     /**
@@ -202,18 +253,53 @@ class MainActivity : ComponentActivity() {
 
     /**
      * 处理分享的文本：保存为临时文件并返回 URI
+     *
+     * 标题同样经过 [sanitizeExternalFileName] 净化，防止路径穿越或生成隐藏文件。
      */
     private fun handleSharedText(intent: Intent): String? {
         val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return null
         val sharedTitle = intent.getStringExtra(Intent.EXTRA_TITLE) ?: "分享内容"
 
         return try {
-            val fileName = "$sharedTitle.md"
-            val file = java.io.File(filesDir, "shared/$fileName")
-            file.parentFile?.mkdirs()
+            val destDir = java.io.File(filesDir, "shared").apply { mkdirs() }
+            val fileName = sanitizeExternalFileName("$sharedTitle.md", destDir)
+                ?: "shared_${System.currentTimeMillis()}.md"
+            val file = uniqueDestFile(destDir, fileName)
             file.writeText(sharedText)
             file.toURI().toString()
         } catch (e: Exception) {
+            Log.e(TAG, "Failed to save shared text", e)
+            null
+        }
+    }
+
+    /**
+     * 净化外部传入的文件名，防止路径穿越和写入预期目录之外。
+     *
+     * - 只保留 basename（去掉路径分隔符）
+     * - 拒绝空名、"."、".."、隐藏文件（以点开头的文件名）
+     * - 长度限制 128 字符
+     * - 最终用 canonical path 校验目标文件确实落在 [destDir] 内
+     *
+     * @return 净化后的文件名；若无法净化则返回 null，调用方应使用默认文件名
+     */
+    private fun sanitizeExternalFileName(name: String, destDir: java.io.File): String? {
+        val base = name.replace('\\', '/').substringAfterLast('/').trim()
+        if (base.isBlank() ||
+            base.contains('/') ||
+            base.contains('\\') ||
+            base == "." ||
+            base == ".." ||
+            base.startsWith(".")
+        ) {
+            return null
+        }
+        val limited = if (base.length > 128) base.take(128) else base
+        return try {
+            val canonicalFile = java.io.File(destDir, limited).canonicalPath
+            val canonicalDir = destDir.canonicalPath
+            if (canonicalFile.startsWith(canonicalDir + java.io.File.separator)) limited else null
+        } catch (_: Exception) {
             null
         }
     }

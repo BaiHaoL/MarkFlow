@@ -21,6 +21,9 @@ data class FileType(
         /** 大 TXT 阈值：超过该字节数的 .txt 文件改用只读分页阅读（0.5MB = 512 * 1024） */
         const val LARGE_FILE_THRESHOLD_BYTES = 512 * 1024L
 
+        /** 大 Markdown 阈值：超过该字节数的 .md 文件预览降级为分页只读（1MB = 1024 * 1024） */
+        const val LARGE_MD_THRESHOLD_BYTES = 1024 * 1024L
+
         /**
          * 支持的文件类型注册表
          *

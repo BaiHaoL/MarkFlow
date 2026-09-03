@@ -9,6 +9,7 @@ import com.markflow.editor.data.repository.FileRepository
 import com.markflow.editor.domain.model.EditorMode
 import com.markflow.editor.domain.model.FileType
 import com.markflow.editor.domain.model.FileType.Companion.LARGE_FILE_THRESHOLD_BYTES
+import com.markflow.editor.domain.model.FileType.Companion.LARGE_MD_THRESHOLD_BYTES
 
 import com.markflow.editor.domain.util.UndoRedoManager
 import com.markflow.editor.util.PagedTextSource
@@ -64,9 +65,11 @@ data class EditorUiState(
     val isTxt: Boolean = false,
     /** 当前文件的文本编码名（如 UTF-8 / GBK），供展示与手动切换；空 = 未识别 */
     val encodingName: String = "",
-    // 大 TXT 只读分页阅读
-    /** 是否为超大 .txt 文件（>0.5MB），走只读分页阅读，不全文载入 */
+    // 大文件（txt / md）只读分页 + 分段编辑
+    /** 是否为超大文件（.txt >0.5MB 或 .md >1MB），走分页只读浏览 + 分段编辑，不全文载入 */
     val isReadOnlyPaged: Boolean = false,
+    /** 是否为超大 .md 文件（>1MB）：与超大 txt 同走分页只读 + 分段编辑，仅用于区分"是否 Markdown" */
+    val isLargeMd: Boolean = false,
     /** 已加载的分页内容缓存：块索引 → 块文本 */
     val pagedPages: Map<Int, String> = emptyMap(),
     /** 正在加载中的块索引集合，避免重复请求 */
@@ -163,10 +166,13 @@ class EditorViewModel @Inject constructor(
         val fileType = FileType.resolve(fileName)
         val isMarkdown = fileType?.isMarkdown ?: false
         val grammarName = fileType?.grammarName ?: ""
-        // 大 TXT 判定：扩展名为 .txt 且大小超过 0.5MB → 走只读分页阅读
+        // 大文件判定：.txt > 0.5MB、.md > 1MB 均直接当大 txt 处理——走分页只读浏览 + 分段编辑，
+        // 全文不载入内存（根除超长 md 全文载入/语法高亮导致的卡顿与崩溃）
         val isTxt = fileName.substringAfterLast('.', "").equals("txt", ignoreCase = true)
         val fileSize = fileRepository.getFileSize(fileUri) ?: 0L
         val isLargeTxt = isTxt && fileSize > LARGE_FILE_THRESHOLD_BYTES
+        val isLargeMd = isMarkdown && fileSize > LARGE_MD_THRESHOLD_BYTES
+        val isPaged = isLargeTxt || isLargeMd
         _uiState.update {
             it.copy(
                 fileUri = fileUri,
@@ -176,10 +182,11 @@ class EditorViewModel @Inject constructor(
                 grammarName = grammarName,
                 isTxt = isTxt,
                 encodingName = encodingOverride?.name() ?: "",
-                isReadOnlyPaged = isLargeTxt,
-                editorMode = if (isLargeTxt) EditorMode.PREVIEW else EditorMode.EDIT,
-                currentContent = if (isLargeTxt) "" else it.currentContent,
-                originalContent = if (isLargeTxt) "" else it.originalContent,
+                isReadOnlyPaged = isPaged,
+                isLargeMd = isLargeMd,
+                editorMode = if (isPaged) EditorMode.PREVIEW else EditorMode.EDIT,
+                currentContent = if (isPaged) "" else it.currentContent,
+                originalContent = if (isPaged) "" else it.originalContent,
                 hasUnsavedChanges = false,
                 pagedEofAt = null,
                 pagedPages = emptyMap(),
@@ -188,7 +195,7 @@ class EditorViewModel @Inject constructor(
                 pagedEditComposition = null
             )
         }
-        if (isLargeTxt) {
+        if (isPaged) {
             // 恢复上次阅读位置（全局字节偏移锚点）
             val savedPos = preferencesManager.getPagedReadPosition(fileUri)
             _uiState.update {
@@ -197,6 +204,11 @@ class EditorViewModel @Inject constructor(
             loadPaged(fileUri, encodingOverride)
             return
         }
+        loadFullContent(fileUri)
+    }
+
+    /** 全文加载：仅普通文件（非大 txt / 大 md，均走分页路径） */
+    private fun loadFullContent(fileUri: String) {
         viewModelScope.launch {
             try {
                 // 文件读取在 IO 线程；手动指定编码（switchEncoding）时按指定解码
@@ -395,7 +407,8 @@ class EditorViewModel @Inject constructor(
     /**
      * 保存 [oldIndex] 段的改动后重建块索引，再切换编排编辑 [newIndex] 段。
      * 写回复用 [persistPagedEdit]（与手动保存同一路径），成功后 loadPaged 重建
-     * （保留 [newIndex] 之前的块缓存，避免阅读区整体抖落），随后进入新段编辑。
+     * （仅保留未受写回影响的块缓存；目标段在编辑段之后时按字节偏移重新定位新块索引），
+     * 随后进入新段编辑。
      */
     private fun saveAndSwitchEdit(oldIndex: Int, newIndex: Int, cursor: Int) {
         val reader = pagedReader ?: return
@@ -403,6 +416,10 @@ class EditorViewModel @Inject constructor(
         val fileUri = _uiState.value.fileUri
         _uiState.update { it.copy(isPagedSaving = true, saveStatus = "切换中…") }
         viewModelScope.launch {
+            // 保存前记录旧索引信息：目标段在编辑段之后时，其字节位置随写回平移，
+            // 需按偏移在新索引中重新定位目标块
+            val oldChunkLen = if (newIndex > oldIndex) reader.chunkByteLengthOf(oldIndex) else null
+            val oldTargetOffset = if (newIndex > oldIndex) reader.chunkOffsetOf(newIndex) else null
             val ok = try {
                 persistPagedEdit(reader, oldIndex, newText)
             } catch (_: Exception) {
@@ -415,19 +432,30 @@ class EditorViewModel @Inject constructor(
                 return@launch
             }
             fileRepository.notifyFileChanged()
-            loadPaged(fileUri, encodingOverride, preserveUntil = newIndex + 1)
+            // 仅保留未受写回影响的块缓存：目标段在编辑段之前时，目标段及之前块均未变；
+            // 否则只有编辑段之前的块未变（编辑段本身及其后块边界已平移，必须重载）
+            val preserveUntil = if (newIndex < oldIndex) newIndex + 1 else oldIndex
+            loadPaged(fileUri, encodingOverride, preserveUntil = preserveUntil)
+            // 目标段在编辑段之后：按"旧偏移 + 长度差"在新索引中解析目标块的新索引
+            val resolvedIndex = if (newIndex > oldIndex && oldTargetOffset != null) {
+                val charset = reader.charset() ?: Charsets.UTF_8
+                val delta = newText.toByteArray(charset).size - (oldChunkLen ?: 0)
+                resolveBlockIndex(oldTargetOffset + delta) ?: newIndex
+            } else {
+                newIndex
+            }
             var tries = 0
             while (tries < 200) {
                 val s = _uiState.value
-                if (s.isReadOnlyPaged && s.pagedPages.containsKey(newIndex)) break
-                if (s.pagedEofAt != null && newIndex >= s.pagedEofAt) break
-                ensurePagedPage(newIndex)
+                if (s.isReadOnlyPaged && s.pagedPages.containsKey(resolvedIndex)) break
+                if (s.pagedEofAt != null && resolvedIndex >= s.pagedEofAt) break
+                ensurePagedPage(resolvedIndex)
                 delay(30)
                 tries++
             }
             val s = _uiState.value
-            if (s.isReadOnlyPaged && s.pagedPages.containsKey(newIndex)) {
-                doStartEdit(newIndex, s.pagedPages[newIndex]!!, cursor)
+            if (s.isReadOnlyPaged && s.pagedPages.containsKey(resolvedIndex)) {
+                doStartEdit(resolvedIndex, s.pagedPages[resolvedIndex]!!, cursor)
             } else {
                 _uiState.update {
                     it.copy(
@@ -564,8 +592,9 @@ class EditorViewModel @Inject constructor(
             }
             if (ok) {
                 fileRepository.notifyFileChanged()
-                // 重建时保留保存块之前的块缓存，避免阅读区整体抖落跳到别处
-                loadPaged(state.fileUri, encodingOverride, preserveUntil = index + 1)
+                // 重建时仅保留保存块【之前】的块缓存：保存块本身及其后块的字节边界
+                // 已随写回变化，必须重新加载，否则界面会回显编辑前的旧内容
+                loadPaged(state.fileUri, encodingOverride, preserveUntil = index)
             } else {
                 _uiState.update {
                     it.copy(
@@ -580,8 +609,9 @@ class EditorViewModel @Inject constructor(
 
     /**
      * 写回编辑后的块。
-     * - file://：RandomAccessFile 随机写；块字节数不变时原地覆盖，
-     *   变化时从脏块起始重写"新块 + 后续所有块"并截断，成本与脏块之后长度成正比；
+     * - file://：RandomAccessFile 随机写（带备份回滚，见 [persistFileRandomWrite]）；
+     *   块字节数不变时原地覆盖，变化时从脏块起始重写"新块 + 后续所有块"并截断，
+     *   成本与脏块之后长度成正比；写失败从备份回滚，不留半新半旧文件；
      * - content://：Documents/MediaStore 不支持随机写，按方案接受整文件覆盖，
      *   先逐块生成临时文件（脏块替换），再整体写回。
      */
@@ -601,6 +631,13 @@ class EditorViewModel @Inject constructor(
         }
     }
 
+    /**
+     * file:// 随机写（带备份回滚）。
+     *
+     * 备份范围按最小必要原则：块字节数不变时仅备份旧块（同长覆写仍是 O(单块)）；
+     * 长度变化时备份"旧块 + 其后所有块"，再写"新块 + 尾部"并截断。
+     * IO 异常时从备份尽力回滚原始内容并恢复原文件长度，避免文件停留在半新半旧状态。
+     */
     private suspend fun persistFileRandomWrite(
         reader: PagedTextSource,
         index: Int,
@@ -610,20 +647,17 @@ class EditorViewModel @Inject constructor(
         val start = reader.chunkOffsetOf(index) ?: return@withContext false
         val oldLen = reader.chunkByteLengthOf(index) ?: return@withContext false
         val raf = fileRepository.openFileWriter(uri) ?: return@withContext false
+        var backup: java.io.File? = null
+        var originalLength = -1L
         try {
-            if (newBytes.size == oldLen) {
-                // 字节长度不变：原地覆盖，成本 O(单块)
-                raf.seek(start)
-                raf.write(newBytes)
-                raf.fd.sync()
-                return@withContext true
-            }
-            // 长度变化：须重写"新块 + 其后所有块"。注意不能用"先写 newBytes 再读后续块"——
-            // newBytes 可能覆盖后续块开头（写后读污染）。先把脏块之后整段落盘到临时文件，
-            // 再拼接写回，避免内存整载尾部。
-            val tail = File.createTempFile("markflow_tail", ".tmp")
-            try {
-                tail.outputStream().use { out ->
+            val firstChunk = reader.rawChunkBytes(index) ?: return@withContext false
+            originalLength = raf.length()
+            backup = java.io.File.createTempFile("markflow_bak", ".tmp")
+
+            // 1) 受影响区备份（所有读操作都发生在写盘之前，无写后读污染）
+            backup.outputStream().use { out ->
+                out.write(firstChunk)
+                if (newBytes.size != oldLen) {
                     var k = index + 1
                     while (true) {
                         val next = reader.rawChunkBytes(k) ?: break
@@ -631,9 +665,14 @@ class EditorViewModel @Inject constructor(
                         k++
                     }
                 }
-                raf.seek(start)
-                raf.write(newBytes)
-                tail.inputStream().use { ins ->
+            }
+
+            // 2) 写新块；长度变化时从备份续写尾部（跳过旧块部分）
+            raf.seek(start)
+            raf.write(newBytes)
+            if (newBytes.size != oldLen) {
+                backup.inputStream().use { ins ->
+                    skipFully(ins, oldLen.toLong())
                     val buf = ByteArray(64 * 1024)
                     while (true) {
                         val n = ins.read(buf)
@@ -642,15 +681,43 @@ class EditorViewModel @Inject constructor(
                     }
                 }
                 raf.setLength(raf.filePointer)
-                raf.fd.sync()
-                true
-            } finally {
-                runCatching { tail.delete() }
             }
+            raf.fd.sync()
+            true
         } catch (_: Exception) {
+            // 3) 回滚：把备份的原始内容写回，并恢复写入前的原始文件长度（尽力而为）
+            runCatching {
+                val bak = backup ?: return@runCatching
+                raf.seek(start)
+                bak.inputStream().use { ins ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        raf.write(buf, 0, n)
+                    }
+                }
+                if (originalLength >= 0) raf.setLength(originalLength)
+                raf.fd.sync()
+            }
             false
         } finally {
             runCatching { raf.close() }
+            runCatching { backup?.delete() }
+        }
+    }
+
+    /** InputStream.skip 不保证跳满，循环跳到指定字节数 */
+    private fun skipFully(ins: java.io.InputStream, bytes: Long) {
+        var remaining = bytes
+        while (remaining > 0) {
+            val skipped = ins.skip(remaining)
+            if (skipped <= 0) {
+                if (ins.read() < 0) break
+                remaining--
+            } else {
+                remaining -= skipped
+            }
         }
     }
 
@@ -1069,6 +1136,10 @@ class EditorViewModel @Inject constructor(
 
     fun confirmDiscard(onApproved: () -> Unit) {
         _uiState.update { it.copy(showExitConfirmDialog = false) }
+        // 大 TXT 分段编辑：放弃前清理编辑态，避免脏状态残留
+        if (_uiState.value.isReadOnlyPaged && _uiState.value.pagedEditingIndex != null) {
+            cancelPagedEdit()
+        }
         // 推迟到下一帧，让 Compose 先移除弹窗再执行导航
         viewModelScope.launch(Dispatchers.Main) {
             onApproved()
@@ -1084,29 +1155,66 @@ class EditorViewModel @Inject constructor(
             // 先关闭弹窗，避免保存期间弹窗悬停
             _uiState.update { it.copy(showExitConfirmDialog = false) }
             val state = _uiState.value
-            if (state.hasUnsavedChanges && !state.isSaving) {
-                _uiState.update { it.copy(isSaving = true, saveStatus = "保存中…") }
-                try {
-                    val success = fileRepository.saveContent(state.fileUri, state.currentContent)
-                    if (success) {
-                        fileRepository.notifyFileChanged()
-                        _uiState.update {
-                            it.copy(
-                                originalContent = it.currentContent,
-                                hasUnsavedChanges = false,
-                                isSaving = false,
-                                saveStatus = "已保存",
-                                tocEntries = TocParser.parse(it.currentContent)
-                            )
-                        }
-                    } else {
-                        _uiState.update { it.copy(isSaving = false, errorMessage = "保存失败，请重试") }
-                        return@launch
-                    }
-                } catch (e: Exception) {
-                    _uiState.update { it.copy(isSaving = false, errorMessage = "保存失败: ${e.message}") }
+            if (!state.hasUnsavedChanges || state.isSaving) {
+                onApproved()
+                return@launch
+            }
+
+            // 大 TXT 分段编辑：必须保存当前编辑块，不能保存 currentContent（大 TXT 下恒为 ""）
+            if (state.isReadOnlyPaged && state.pagedEditingIndex != null) {
+                val index = state.pagedEditingIndex
+                val reader = pagedReader ?: run {
+                    _uiState.update { it.copy(errorMessage = "分页阅读器未就绪，保存失败") }
                     return@launch
                 }
+                val newText = state.pagedEditingText
+                _uiState.update { it.copy(isPagedSaving = true, saveStatus = "保存中") }
+                val ok = try {
+                    persistPagedEdit(reader, index, newText)
+                } catch (e: Exception) {
+                    _uiState.update { it.copy(isPagedSaving = false, saveStatus = "保存失败", errorMessage = "保存失败: ${e.message}") }
+                    return@launch
+                }
+                if (!ok) {
+                    _uiState.update { it.copy(isPagedSaving = false, saveStatus = "保存失败") }
+                    return@launch
+                }
+                fileRepository.notifyFileChanged()
+                loadPaged(state.fileUri, encodingOverride, preserveUntil = index + 1)
+                // 等待 loadPaged 重建完成（pagedEditingIndex 被清空且保存态结束）
+                var tries = 0
+                while (tries < 200) {
+                    val s = _uiState.value
+                    if (s.pagedEditingIndex == null && !s.isPagedSaving) break
+                    delay(30)
+                    tries++
+                }
+                onApproved()
+                return@launch
+            }
+
+            // 普通文件保存逻辑
+            _uiState.update { it.copy(isSaving = true, saveStatus = "保存中…") }
+            try {
+                val success = fileRepository.saveContent(state.fileUri, state.currentContent)
+                if (success) {
+                    fileRepository.notifyFileChanged()
+                    _uiState.update {
+                        it.copy(
+                            originalContent = it.currentContent,
+                            hasUnsavedChanges = false,
+                            isSaving = false,
+                            saveStatus = "已保存",
+                            tocEntries = TocParser.parse(it.currentContent)
+                        )
+                    }
+                } else {
+                    _uiState.update { it.copy(isSaving = false, errorMessage = "保存失败，请重试") }
+                    return@launch
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(isSaving = false, errorMessage = "保存失败: ${e.message}") }
+                return@launch
             }
             onApproved()
         }
@@ -1121,6 +1229,7 @@ class EditorViewModel @Inject constructor(
     /** UI 上报当前可视首个块索引：防抖换算为全局字节偏移并落盘（供下次恢复） */
     fun onPagedScrollPosition(blockIndex: Int) {
         if (blockIndex < 0) return
+        // 大 txt / 大 md（分页只读）都记录阅读位置
         if (!_uiState.value.isReadOnlyPaged) return
         if (pagedReader == null) return
         // 主线程同步记录最新可见块，作为书签与退出落盘的稳定依据

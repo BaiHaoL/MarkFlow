@@ -136,6 +136,63 @@ class PagedTextSourceTest {
     }
 
     @Test
+    fun `utf16le 分块不错位乱码`() = runTest {
+        val content = buildString {
+            for (i in 1..2000) append("第 $i 行：UTF-16LE 中文分块测试内容。\n")
+        }
+        val bom = byteArrayOf(0xFF.toByte(), 0xFE.toByte())
+        val bytes = bom + content.toByteArray(Charsets.UTF_16LE)
+        val source = PagedTextSource(open = { ByteArraySeekReader(bytes) })
+        val (joined, chunkCount) = readAll(source)
+        assertTrue("应产生多块，实际 $chunkCount 块", chunkCount > 1)
+        assertEquals("UTF-16LE 拼接应无损还原原文", content, joined)
+        assertTrue("不应出现替换符", !joined.contains('�'))
+    }
+
+    @Test
+    fun `utf16be 分块不错位乱码`() = runTest {
+        val content = buildString {
+            for (i in 1..2000) append("第 $i 行：UTF-16BE 中文分块测试内容。\n")
+        }
+        val bom = byteArrayOf(0xFE.toByte(), 0xFF.toByte())
+        val bytes = bom + content.toByteArray(Charsets.UTF_16BE)
+        val source = PagedTextSource(open = { ByteArraySeekReader(bytes) })
+        val (joined, chunkCount) = readAll(source)
+        assertTrue("应产生多块，实际 $chunkCount 块", chunkCount > 1)
+        assertEquals("UTF-16BE 拼接应无损还原原文", content, joined)
+        assertTrue("不应出现替换符", !joined.contains('�'))
+    }
+
+    @Test
+    fun `utf8 超长行硬截断不切断多字节字符`() = runTest {
+        // 300KB 无换行中文行：强制截断处必然落在多字节字符中间，应回退到完整字符边界
+        val longLine = "中".repeat(100_000)
+        val content = longLine + "\n尾部\n"
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        val source = PagedTextSource(open = { ByteArraySeekReader(bytes) })
+        val (joined, chunkCount) = readAll(source)
+        assertTrue("应产生多块，实际 $chunkCount 块", chunkCount >= 2)
+        assertEquals("拼接应无损还原原文（无替换符）", content, joined)
+    }
+
+    @Test
+    fun `utf16le 块边界应为偶数字节偏移`() = runTest {
+        val content = buildString {
+            for (i in 1..1500) append("ROW_$i UTF-16 偶偏移校验行。\n")
+        }
+        val bom = byteArrayOf(0xFF.toByte(), 0xFE.toByte())
+        val bytes = bom + content.toByteArray(Charsets.UTF_16LE)
+        val source = PagedTextSource(open = { ByteArraySeekReader(bytes) })
+        var index = 0
+        while (true) {
+            val offset = source.chunkOffsetOf(index) ?: break
+            assertEquals("块 $index 起始偏移应为偶数（编码单元对齐）", 0L, offset % 2)
+            index++
+        }
+        assertTrue("应产生多块，实际 $index 块", index > 1)
+    }
+
+    @Test
     fun `越界访问返回 null`() = runTest {
         val content = "只有一行\n"
         val source = textSource(content)

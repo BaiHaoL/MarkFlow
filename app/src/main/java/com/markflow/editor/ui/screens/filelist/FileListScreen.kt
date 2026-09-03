@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -27,6 +28,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -42,6 +44,7 @@ import com.markflow.editor.domain.model.FileType
 import com.markflow.editor.domain.model.MarkdownFile
 import com.markflow.editor.domain.model.SortMode
 import com.markflow.editor.ui.components.BottomActionBar
+import com.markflow.editor.util.resolveShareMimeType
 import kotlinx.coroutines.delay
 import java.io.File
 import java.text.SimpleDateFormat
@@ -94,6 +97,24 @@ fun FileListScreen(
         }
     }
 
+    // Android 11+ 非本应用文件操作授权
+    val securityLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.onSecurityConsentResult(result.resultCode == android.app.Activity.RESULT_OK)
+    }
+    LaunchedEffect(uiState.pendingSecurityRequest) {
+        uiState.pendingSecurityRequest?.let { request ->
+            try {
+                securityLauncher.launch(
+                    IntentSenderRequest.Builder(request.intentSender).build()
+                )
+            } catch (e: Exception) {
+                viewModel.dismissSecurityRequest()
+            }
+        }
+    }
+
     // 新建文件对话框状态
     var newFileName by remember { mutableStateOf("") }
     var showCreateDialog by remember { mutableStateOf(false) }
@@ -114,6 +135,17 @@ fun FileListScreen(
     // 多选模式下拦截返回键：退出多选而非退出应用
     BackHandler(enabled = uiState.isSelectionMode) {
         viewModel.exitSelectionMode()
+    }
+
+    // 搜索状态（搜索框有焦点或有关键词）下拦截返回键：退出搜索而非退出应用
+    val searchFocusManager = LocalFocusManager.current
+    var isSearchFocused by remember { mutableStateOf(false) }
+    val isSearchActive = isSearchFocused || uiState.searchQuery.isNotEmpty()
+    BackHandler(enabled = isSearchActive) {
+        if (uiState.searchQuery.isNotEmpty()) {
+            viewModel.updateSearchQuery("")
+        }
+        searchFocusManager.clearFocus()
     }
 
     Scaffold(
@@ -165,19 +197,28 @@ fun FileListScreen(
                     selectedCount = uiState.selectedFiles.size,
                     onDelete = { viewModel.showDeleteConfirm() },
                     onShare = {
-                        // 仅单选时可分享
                         val selected = uiState.selectedFiles
-                        if (selected.size == 1) {
-                            val file = uiState.files.find { it.uri == selected.first() } ?: return@BottomActionBar
-                            val shareUri = resolveShareUri(context, file)
-                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/markdown"
-                                putExtra(Intent.EXTRA_SUBJECT, file.fileName)
-                                putExtra(Intent.EXTRA_STREAM, shareUri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            context.startActivity(Intent.createChooser(shareIntent, "分享文件"))
+                        if (selected.isEmpty()) return@BottomActionBar
+
+                        val selectedFiles = uiState.files.filter { it.uri in selected }
+                        val shareUris = ArrayList<Uri>().apply {
+                            selectedFiles.forEach { add(resolveShareUri(context, it)) }
                         }
+
+                        val shareIntent = if (selectedFiles.size == 1) {
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = resolveShareMimeType(selectedFiles.first().fileName)
+                                putExtra(Intent.EXTRA_SUBJECT, selectedFiles.first().fileName)
+                                putExtra(Intent.EXTRA_STREAM, shareUris.first())
+                            }
+                        } else {
+                            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                type = "*/*"
+                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, shareUris)
+                            }
+                        }
+                        shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        context.startActivity(Intent.createChooser(shareIntent, "分享文件"))
                     },
                     onRename = {
                         // 仅单选时可重命名
@@ -267,7 +308,8 @@ fun FileListScreen(
                             // 搜索栏（固定，不参与下拉刷新）
                             FileSearchBar(
                                 query = uiState.searchQuery,
-                                onQueryChange = { viewModel.updateSearchQuery(it) }
+                                onQueryChange = { viewModel.updateSearchQuery(it) },
+                                onFocusChange = { isSearchFocused = it }
                             )
 
                             // 根据搜索关键词过滤文件
@@ -604,6 +646,9 @@ fun FileListScreen(
                             trimmed == "." || trimmed.all { it == '.' } -> {
                                 validationError = "文件名不能仅由点号组成"
                             }
+                            trimmed.endsWith('.') -> {
+                                validationError = "文件名不能以点号结尾"
+                            }
                             else -> {
                                 validationError = null
                                 viewModel.renameFile(trimmed)
@@ -625,6 +670,33 @@ fun FileListScreen(
             dismissButton = {
                 TextButton(
                     onClick = { viewModel.dismissRenameDialog() },
+                    enabled = !uiState.isRenaming
+                ) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
+    // 后缀变化确认对话框（方案2：可改后缀，变化时先弹确认，类似文件管理器）
+    if (uiState.showRenameConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissRenameConfirm() },
+            title = { Text("更改扩展名") },
+            text = {
+                Text("更改文件扩展名可能导致文件无法正常打开。\n若改为不受支持的后缀，文件可能不会显示在列表中。确定要继续吗？")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { viewModel.confirmRename() },
+                    enabled = !uiState.isRenaming
+                ) {
+                    Text("确定")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { viewModel.dismissRenameConfirm() },
                     enabled = !uiState.isRenaming
                 ) {
                     Text("取消")
@@ -982,14 +1054,16 @@ private fun DetailRow(label: String, value: String) {
 @Composable
 private fun FileSearchBar(
     query: String,
-    onQueryChange: (String) -> Unit
+    onQueryChange: (String) -> Unit,
+    onFocusChange: (Boolean) -> Unit
 ) {
     OutlinedTextField(
         value = query,
         onValueChange = onQueryChange,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .onFocusChanged { onFocusChange(it.isFocused) },
         placeholder = { Text("搜索文件…") },
         leadingIcon = {
             Icon(

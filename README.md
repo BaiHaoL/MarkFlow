@@ -5,18 +5,20 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 ## 功能特性
 
 ### 文件管理
-- 自动扫描设备上的 Markdown 文件（`.md` / `.markdown`）
+- 自动扫描文档目录（`Documents/`、`Download/`）中的 Markdown 文件（`.md` / `.markdown`），不扫描全盘
+- 自动排除视频 / 音频 / 图片等媒体文件（如 `.ts` 视频），仅显示文本类文件
+- 支持多选文件，可批量分享、删除
 - 支持按修改时间或文件名排序
 - 文件分区：本地 / 最近打开 / 其他（非 Markdown 文本文件）
 - 多选模式：批量删除
-- 单文件操作：重命名、查看详情、分享
+- 单文件操作：重命名（可修改后缀，后缀变化时弹确认提示）、查看详情、分享
 - 新建文件（自定义文件名 + 后缀选择，默认 `.md`）
 - 从手机导入已有文本文档
 - 保存文件后自动后台刷新列表，无闪烁更新
 
 ### 编辑器
 - 编辑 / 预览模式切换（顶部单图标互切：编辑=笔、预览=眼睛，同一位置），滚动位置记忆（切换回编辑模式时保持原位置）
-- 语法高亮提示（代码块、标题、列表等，覆盖 11 种 Markdown 元素）
+- 语法高亮提示（代码块、标题、列表等，覆盖 11 种 Markdown 元素；大文档后台线程 + 80ms 防抖异步计算，输入不卡顿）
 - 撤销 / 重做（含光标位置追踪）
 - 自动保存（编辑状态停止输入 3 秒后触发，不影响撤销/重做历史）
 - 自动格式化：列表续行（无序/有序/复选框）、缩进保留、有序列表自动编号、空列表项清理
@@ -47,10 +49,11 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 - 有语法高亮：`.sh` `.bash` `.zsh` `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.hxx` `.java` `.kt` `.kts` `.js` `.mjs` `.ts` `.tsx` `.go` `.rs` `.swift` `.dart` `.php` `.rb` `.lua` `.sql` `.json` `.jsonc` `.yaml` `.yml` `.toml` `.xml` `.html` `.htm` `.css` `.scss` `.less` `.dockerfile` `.docker` `.diff` `.patch` — 编辑模式 + 代码卡片预览
 - 纯文本：`.txt` `.log` `.text` `.ini` `.conf` `.cfg` `.properties` `.env` — 仅编辑模式
 - 大文本（>0.5MB）：自动分段只读预览，按需分页加载并回收远端分块；滚动定位记忆（全局字节偏移锚点，防抖落盘，退出自动保存）
+- 大 Markdown（>1MB）：与超大文本同走分页只读浏览 + 分段编辑，全文不载入内存（避免超大文档渲染崩溃与卡顿）
 
 ### 跨应用支持
 - 从文件管理器或其他应用打开文本类文件
-- 从其他应用分享文本到 MarkFlow
+- 从其他应用分享文本或文件到 MarkFlow（自动复制到应用私有目录后打开）
 - 自动处理 `content://` / `file://` URI 的文件复制
 - 支持无标准 MIME 类型的文件（如 `.toml`）
 
@@ -151,14 +154,18 @@ JLaTeXMath 引擎内部大量使用反射（`Class.forName` / `getMethod` 等）
 
 ### Release 签名
 
-Release 构建需要签名密钥。在项目根目录创建 `keystore.properties`：
+Release 构建需要签名密钥。签名文件存放在**用户家目录** `~/.markflow/`（不在项目仓库内，避免密钥入库）：
 
 ```properties
-storeFile=your-keystore.jks
+# 文件位置：~/.markflow/keystore.properties
+storeFile=markflow-release.keystore
 storePassword=your-store-password
 keyAlias=your-key-alias
 keyPassword=your-key-password
 ```
+
+- `storeFile` 支持相对路径（相对于 `~/.markflow/`）或绝对路径
+- 若 `~/.markflow/keystore.properties` 不存在、缺少必需键或 keystore 文件不存在，Release 打包会**直接失败**（不会静默回退到 debug 签名）；不影响 Debug 构建与 IDE 同步
 
 ## 最低要求
 

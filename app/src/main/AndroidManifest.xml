@@ -64,7 +64,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
+                <!-- BROWSABLE 仅用于 http/https 深链，与 file/content 组合会被浏览器借深链拉起应用并传入可控文件，故移除 -->
 
                 <data android:scheme="file" />
                 <data android:scheme="content" />
@@ -189,11 +189,22 @@
                 <data android:pathPattern=".*\..*\..*\.sh" />
             </intent-filter>
 
-            <!-- 支持从其他应用分享文本到 MarkFlow -->
+            <!-- 支持从其他应用分享文本/文件到 MarkFlow -->
+            <!-- 文件分享走 EXTRA_STREAM（content:// URI），MIME 覆盖需与 VIEW 一致，
+                 否则分享 .md/.toml 等文件时 MarkFlow 不会出现在分享目标列表 -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/json" />
+                <data android:mimeType="application/xml" />
+                <data android:mimeType="text/xml" />
+                <data android:mimeType="application/x-sh" />
+                <data android:mimeType="application/x-shellscript" />
+                <data android:mimeType="application/x-python" />
+                <data android:mimeType="application/x-yaml" />
+                <data android:mimeType="application/x-httpd-php" />
+                <data android:mimeType="application/octet-stream" />
             </intent-filter>
         </activity>
 

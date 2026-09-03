@@ -1,5 +1,6 @@
 package com.markflow.editor.ui.screens.filelist
 
+import android.content.IntentSender
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -7,6 +8,8 @@ import com.markflow.editor.data.local.PreferencesManager
 import com.markflow.editor.data.repository.FileRepository
 import com.markflow.editor.domain.model.FileSource
 import com.markflow.editor.domain.model.MarkdownFile
+import com.markflow.editor.domain.model.PendingFileOperation
+import com.markflow.editor.domain.model.SecurityConsentRequiredException
 import com.markflow.editor.domain.model.SortMode
 import com.markflow.editor.domain.util.FileSorter
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -39,6 +42,10 @@ data class FileListUiState(
     val renameTargetFile: MarkdownFile? = null,
     /** 重命名操作是否正在进行中 */
     val isRenaming: Boolean = false,
+    /** 后缀变化确认框是否显示（方案2：可改后缀，变化时先弹确认） */
+    val showRenameConfirmDialog: Boolean = false,
+    /** 待确认的新文件名（后缀变化时暂存） */
+    val pendingRenameName: String = "",
     val showDeleteConfirmDialog: Boolean = false,
     /** 删除时是否同时删除文件本身；false（默认）则仅从列表移除 */
     val deleteWithFile: Boolean = false,
@@ -48,7 +55,16 @@ data class FileListUiState(
     val showNewFileDialog: Boolean = false,
     val pendingNewFileContent: String = "",
     /** 新建文件成功后的 URI，用于导航到编辑器 */
-    val navigateToEditorUri: String? = null
+    val navigateToEditorUri: String? = null,
+    /** Android 11+ 非本应用文件操作需要弹系统授权框 */
+    val pendingSecurityRequest: PendingSecurityRequest? = null
+)
+
+/**
+ * 待用户授权的安全请求。
+ */
+data class PendingSecurityRequest(
+    val intentSender: IntentSender
 )
 
 /**
@@ -70,6 +86,9 @@ class FileListViewModel @Inject constructor(
 
     /** 文件加载任务，确保同时只有一个在运行，避免竞态条件 */
     private var loadJob: Job? = null
+
+    /** Android 11+ 非本应用文件操作授权通过后重试 */
+    private var pendingSecurityOperation: PendingFileOperation? = null
 
     init {
         val savedSortMode = preferencesManager.getSortMode()
@@ -203,15 +222,25 @@ class FileListViewModel @Inject constructor(
         }
     }
 
-    /** 全选 / 取消全选 */
+    /** 全选 / 取消全选（仅作用于当前搜索过滤后的可见文件） */
     fun toggleSelectAll() {
         _uiState.update { state ->
-            if (state.selectedFiles.size == state.files.size) {
-                state.copy(selectedFiles = emptySet())
+            val visibleFiles = filterFilesByQuery(state.files, state.searchQuery)
+            val visibleUris = visibleFiles.map { it.uri }.toSet()
+            val currentlySelectedVisible = state.selectedFiles.intersect(visibleUris)
+            if (currentlySelectedVisible.size == visibleUris.size && visibleUris.isNotEmpty()) {
+                // 当前可见文件已全部选中 → 取消选中这些可见文件（保留不可见文件的选中态）
+                state.copy(selectedFiles = state.selectedFiles - visibleUris)
             } else {
-                state.copy(selectedFiles = state.files.map { it.uri }.toSet())
+                // 选中所有可见文件
+                state.copy(selectedFiles = state.selectedFiles + visibleUris)
             }
         }
+    }
+
+    private fun filterFilesByQuery(files: List<MarkdownFile>, query: String): List<MarkdownFile> {
+        return if (query.isBlank()) files
+        else files.filter { it.fileName.contains(query, ignoreCase = true) }
     }
 
     /** 退出多选模式 */
@@ -225,26 +254,64 @@ class FileListViewModel @Inject constructor(
      * 删除选中的文件。
      * - deleteWithFile = true：物理删除文件本身；
      * - deleteWithFile = false（默认）：仅从软件文件列表移除，文件保留在设备上。
+     *
+     * 删除成功后直接从内存列表移除，避免大量文件时全量重扫 MediaStore 导致卡顿。
      */
-    fun deleteSelectedFiles() {
+    fun deleteSelectedFiles(urisOverride: List<String>? = null) {
         viewModelScope.launch {
-            val uris = _uiState.value.selectedFiles.toList()
-            if (_uiState.value.deleteWithFile) {
-                fileRepository.deleteFiles(uris)
-                // 物理删除后清理隐藏记录，防止 URI 复用导致误隐藏
-                fileRepository.unhideFiles(uris)
-            } else {
-                fileRepository.hideFiles(uris)
+            val state = _uiState.value
+            val uris = urisOverride ?: state.selectedFiles.toList()
+            val removedUris = try {
+                if (state.deleteWithFile) {
+                    fileRepository.deleteFiles(uris).also {
+                        // 物理删除后清理隐藏记录，防止 URI 复用导致误隐藏
+                        fileRepository.unhideFiles(it.toList())
+                    }
+                } else {
+                    fileRepository.hideFiles(uris)
+                    uris.toSet()
+                }
+            } catch (e: SecurityConsentRequiredException) {
+                // 先落盘已成功删除的部分：从内存列表移除 + 清理隐藏记录 + 更新选中集，
+                // 否则已删文件仍显示在列表中（UI 与磁盘状态不一致）
+                if (e.partialSucceeded.isNotEmpty()) {
+                    fileRepository.unhideFiles(e.partialSucceeded.toList())
+                    _uiState.update { current ->
+                        current.copy(
+                            importedFiles = current.importedFiles.filterNot { it.uri in e.partialSucceeded },
+                            localFiles = current.localFiles.filterNot { it.uri in e.partialSucceeded },
+                            otherFiles = current.otherFiles.filterNot { it.uri in e.partialSucceeded },
+                            files = current.files.filterNot { it.uri in e.partialSucceeded },
+                            selectedFiles = current.selectedFiles - e.partialSucceeded
+                        )
+                    }
+                }
+                pendingSecurityOperation = e.pendingOperation
+                _uiState.update {
+                    it.copy(
+                        pendingSecurityRequest = PendingSecurityRequest(e.intentSender),
+                        showDeleteConfirmDialog = false
+                    )
+                }
+                return@launch
             }
-            _uiState.update {
-                it.copy(
-                    isSelectionMode = false,
-                    selectedFiles = emptySet(),
+
+            _uiState.update { current ->
+                // 授权重试路径（urisOverride != null）仅移除本次删除项，保留其余选中状态；
+                // 正常路径（用户主动删除当前选中集）退出多选
+                val remainingSelected = current.selectedFiles - removedUris
+                val isRetry = urisOverride != null
+                current.copy(
+                    importedFiles = current.importedFiles.filterNot { it.uri in removedUris },
+                    localFiles = current.localFiles.filterNot { it.uri in removedUris },
+                    otherFiles = current.otherFiles.filterNot { it.uri in removedUris },
+                    files = current.files.filterNot { it.uri in removedUris },
+                    isSelectionMode = isRetry && remainingSelected.isNotEmpty(),
+                    selectedFiles = if (isRetry) remainingSelected else emptySet(),
                     showDeleteConfirmDialog = false,
                     deleteWithFile = false
                 )
             }
-            loadFiles()
         }
     }
 
@@ -275,17 +342,36 @@ class FileListViewModel @Inject constructor(
         // 防止重复提交
         if (_uiState.value.isRenaming) return
 
-        // 非 Markdown 文件若新名丢掉了扩展名，自动补回原后缀，避免重命名改坏后缀
+        // 方案2：允许修改后缀；后缀变化（忽略大小写）时先弹确认框
         val originalExt = target.fileName.substringAfterLast('.', "")
-        val effectiveName = if (!target.isMarkdown && newName.lastIndexOf('.') <= 0 && originalExt.isNotEmpty()) {
-            "$newName.$originalExt"
+        val newExt = newName.substringAfterLast('.', "")
+        val extChanged = !originalExt.equals(newExt, ignoreCase = true)
+
+        if (extChanged) {
+            _uiState.update { it.copy(showRenameConfirmDialog = true, pendingRenameName = newName) }
         } else {
-            newName
+            doRename(newName)
         }
+    }
+
+    fun confirmRename() {
+        val pending = _uiState.value.pendingRenameName
+        _uiState.update { it.copy(showRenameConfirmDialog = false, pendingRenameName = "") }
+        if (pending.isNotEmpty()) doRename(pending)
+    }
+
+    fun dismissRenameConfirm() {
+        _uiState.update { it.copy(showRenameConfirmDialog = false, pendingRenameName = "") }
+    }
+
+    private fun doRename(newName: String, targetUri: String? = null) {
+        val target = _uiState.value.renameTargetFile
+        val uri = targetUri ?: target?.uri ?: return
+        if (_uiState.value.isRenaming) return
 
         viewModelScope.launch {
             _uiState.update { it.copy(isRenaming = true) }
-            val result = fileRepository.renameFile(target.uri, effectiveName)
+            val result = fileRepository.renameFile(uri, newName)
             result.fold(
                 onSuccess = {
                     _uiState.update {
@@ -300,17 +386,48 @@ class FileListViewModel @Inject constructor(
                     loadFiles()
                 },
                 onFailure = { e ->
-                    _uiState.update {
-                        it.copy(
-                            isRenaming = false,
-                            showRenameDialog = false,
-                            renameTargetFile = null,
-                            errorMessage = e.message ?: "重命名失败"
-                        )
+                    if (e is SecurityConsentRequiredException) {
+                        pendingSecurityOperation = e.pendingOperation
+                        _uiState.update {
+                            it.copy(
+                                isRenaming = false,
+                                pendingSecurityRequest = PendingSecurityRequest(e.intentSender)
+                            )
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                isRenaming = false,
+                                showRenameDialog = false,
+                                renameTargetFile = null,
+                                errorMessage = e.message ?: "重命名失败"
+                            )
+                        }
                     }
                 }
             )
         }
+    }
+
+    /**
+     * 用户响应系统文件授权对话框后的回调。
+     * granted = true 时重试之前被拦截的重命名/删除操作。
+     */
+    fun onSecurityConsentResult(granted: Boolean) {
+        val operation = pendingSecurityOperation
+        pendingSecurityOperation = null
+        _uiState.update { it.copy(pendingSecurityRequest = null) }
+        if (!granted || operation == null) return
+        when (operation) {
+            is PendingFileOperation.Rename -> doRename(operation.newName, operation.uri)
+            is PendingFileOperation.Delete -> deleteSelectedFiles(operation.uris)
+        }
+    }
+
+    /** 主动取消待授权请求 */
+    fun dismissSecurityRequest() {
+        pendingSecurityOperation = null
+        _uiState.update { it.copy(pendingSecurityRequest = null) }
     }
 
     fun showFileDetails(file: MarkdownFile) {

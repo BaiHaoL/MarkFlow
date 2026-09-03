@@ -80,9 +80,9 @@ class FileRepository @Inject constructor(
     }
 
     /**
-     * 删除文件
+     * 删除文件，返回成功删除的 URI 集合。
      */
-    suspend fun deleteFiles(uris: List<String>): Int {
+    suspend fun deleteFiles(uris: List<String>): Set<String> {
         return storageRepository.deleteFiles(uris)
     }
 

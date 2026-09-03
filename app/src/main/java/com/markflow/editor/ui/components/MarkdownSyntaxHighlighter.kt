@@ -1,5 +1,6 @@
 package com.markflow.editor.ui.components
 
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -9,6 +10,12 @@ import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Markdown 编辑模式语法高亮
@@ -28,6 +35,11 @@ import androidx.compose.ui.text.style.TextDecoration
  * - LIST_UNORDERED→ 无序列表标记（- * +）用主题色
  * - QUOTATION     → 引用标记（>）用引用色
  * - HORIZONTAL_RULE → 分隔线（--- *** ___）用灰色
+ *
+ * 执行策略（按文档大小分流，避免长文档主线程卡顿）：
+ * - ≤ 16K 字符：filter 内同步计算，与原行为一致（即时高亮）；
+ * - \> 16K 字符：后台线程 + 80ms debounce 异步计算，期间先返回纯文本不阻塞输入，
+ *   计算完成后经快照状态触发重组并命中 LRU 缓存上屏。
  *
  * 不负责（由 Prism4j 在预览模式处理）：
  * - 代码块语法高亮
@@ -122,23 +134,90 @@ class MarkdownSyntaxHighlighter(
 
         // 分隔线：--- *** ___（独占一行）
         private val RULE_PATTERN = Regex("""^(\s*[-*_]{3,})\s*$""", RegexOption.MULTILINE)
+
+        /** 小于该字符数的文档在 filter 内同步高亮（即时体验）；超过则异步计算 */
+        private const val SYNC_THRESHOLD_CHARS = 16_000
+
+        /** 异步高亮 debounce（毫秒）：停止输入该时长后才在后台计算 */
+        private const val HIGHLIGHT_DEBOUNCE_MS = 80L
+
+        /** 异步结果缓存上限（按访问序 LRU 逐出，防大文档多版本驻留内存） */
+        private const val MAX_CACHE_ENTRIES = 8
+    }
+
+    // ==================== 异步高亮（大文档） ====================
+
+    /** 异步高亮结果缓存：key = 文本内容，按访问序 LRU 逐出 */
+    private val highlightCache = object : LinkedHashMap<String, AnnotatedString>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, AnnotatedString>?): Boolean =
+            size > MAX_CACHE_ENTRIES
+    }
+
+    /** 快照状态：异步计算完成后自增，触发 filter 重新执行并命中缓存 */
+    private val cacheVersion = mutableIntStateOf(0)
+
+    private var highlightJob: Job? = null
+    private val highlightScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** 取消未完成的异步计算（组件销毁时调用，防对脱离组合的状态写入） */
+    fun cancelPending() {
+        highlightJob?.cancel()
     }
 
     // ==================== VisualTransformation 实现 ====================
 
     override fun filter(text: AnnotatedString): TransformedText {
-        val builder = AnnotatedString.Builder(text.text)
         val raw = text.text
+
+        if (raw.isEmpty()) {
+            return TransformedText(applyBaseColor(raw), OffsetMapping.Identity)
+        }
+
+        // 小文档：同步计算（与原行为一致，即时高亮，无感知差异）
+        if (raw.length <= SYNC_THRESHOLD_CHARS) {
+            return TransformedText(computeHighlight(raw), OffsetMapping.Identity)
+        }
+
+        // 大文档：命中缓存直接返回；未命中先返回纯文本（不阻塞输入），
+        // 后台 + debounce 计算完成后自增版本号触发重组，再次执行时命中缓存
+        cacheVersion.intValue // 订阅快照状态（本行仅读取，建立依赖）
+        synchronized(highlightCache) {
+            highlightCache[raw]?.let { return TransformedText(it, OffsetMapping.Identity) }
+        }
+        scheduleAsyncHighlight(raw)
+        return TransformedText(applyBaseColor(raw), OffsetMapping.Identity)
+    }
+
+    /** 后台 + debounce 计算大文档高亮，结果写入 LRU 缓存并触发重组 */
+    private fun scheduleAsyncHighlight(raw: String) {
+        highlightJob?.cancel()
+        highlightJob = highlightScope.launch {
+            delay(HIGHLIGHT_DEBOUNCE_MS)
+            val highlighted = computeHighlight(raw)
+            synchronized(highlightCache) { highlightCache[raw] = highlighted }
+            // 快照状态允许跨线程写入；自增后订阅方（filter）重组并命中缓存
+            cacheVersion.intValue++
+        }
+    }
+
+    /** 仅铺基础文本色（空文本 / 异步计算期间的过渡形态） */
+    private fun applyBaseColor(raw: String): AnnotatedString {
+        val builder = AnnotatedString.Builder(raw)
+        if (raw.isNotEmpty()) {
+            builder.addStyle(SpanStyle(color = colors.text), 0, raw.length)
+        }
+        return builder.toAnnotatedString()
+    }
+
+    /** 全量计算 11 种元素的语法高亮（同步路径直接调用；异步路径在后台线程调用） */
+    private fun computeHighlight(raw: String): AnnotatedString {
+        val builder = AnnotatedString.Builder(raw)
 
         // 应用基础文本颜色
         builder.addStyle(
             SpanStyle(color = colors.text),
             0, raw.length
         )
-
-        if (raw.isEmpty()) {
-            return TransformedText(builder.toAnnotatedString(), OffsetMapping.Identity)
-        }
 
         // 按优先级应用高亮（后面的可能覆盖前面的）
         applyHeadingHighlight(raw, builder)
@@ -152,7 +231,7 @@ class MarkdownSyntaxHighlighter(
         applyQuoteHighlight(raw, builder)
         applyRuleHighlight(raw, builder)
 
-        return TransformedText(builder.toAnnotatedString(), OffsetMapping.Identity)
+        return builder.toAnnotatedString()
     }
 
     // ==================== 高亮方法 ====================

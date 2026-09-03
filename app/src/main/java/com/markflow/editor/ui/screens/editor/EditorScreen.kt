@@ -71,6 +71,7 @@ import com.markflow.editor.ui.components.MarkdownSyntaxHighlighter
 import com.markflow.editor.ui.components.SearchBar
 import com.markflow.editor.util.MarkwonConfig
 import com.markflow.editor.util.AutoTextFormatter
+import com.markflow.editor.util.resolveShareMimeType
 import java.io.File
 
 /** txt 编码手动切换的候选列表（不含"自动检测"，该项单独提供） */
@@ -317,8 +318,8 @@ fun EditorScreen(
                                         modifier = Modifier.size(20.dp)
                                     )
                                 }
-                                // 目录按钮：仅 Markdown 文件显示
-                                if (uiState.isMarkdown) {
+                                // 目录按钮：仅 Markdown 文件显示（大 md 分页只读不全文载入，无法生成目录）
+                                if (uiState.isMarkdown && !uiState.isReadOnlyPaged) {
                                     IconButton(onClick = { viewModel.toggleToc() }) {
                                         Icon(Icons.AutoMirrored.Filled.List, contentDescription = "目录大纲")
                                     }
@@ -449,7 +450,7 @@ fun EditorScreen(
                     when (uiState.editorMode) {
                         EditorMode.EDIT -> {
                             if (uiState.isReadOnlyPaged) {
-                                // 大 txt：分页浏览 + 长按分段编辑（不全文载入）
+                                // 大 txt / 大 md：分页浏览 + 长按分段编辑（不全文载入）
                                 PagedReadContentView(
                                     listState = pagedListState,
                                     pages = uiState.pagedPages,
@@ -479,7 +480,10 @@ fun EditorScreen(
                                     },
                                     scrollState = editScrollState,
                                     initialGoodScroll = initialGoodScroll,
-                                    isMarkdown = uiState.isMarkdown,
+                                    // 大 md：编辑保留全文但禁用语法高亮（防 2.38MB 级文档高亮开销）
+                                    isMarkdown = uiState.isMarkdown && !uiState.isLargeMd,
+                                    // 占位仅对 Markdown 空白文件显示（非 .md 空白文件不显示语法参考）
+                                    showMarkdownPlaceholder = uiState.isMarkdown,
                                     isDarkTheme = isDarkTheme,
                                     searchQuery = uiState.searchQuery,
                                     searchMatches = uiState.searchMatchPositions,
@@ -491,8 +495,8 @@ fun EditorScreen(
                         }
                         EditorMode.PREVIEW -> {
                             when {
-                                uiState.isReadOnlyPaged -> {
-                                    // 大 txt：分页只读预览（不全文载入）
+                                uiState.isReadOnlyPaged || uiState.isLargeMd -> {
+                                    // 大 txt / 大 md：分页只读预览（不全文载入，避免大文档渲染崩溃）
                                     PagedReadContentView(
                                         listState = pagedListState,
                                         pages = uiState.pagedPages,
@@ -1055,6 +1059,8 @@ private fun EditContentView(
     scrollState: ScrollState = rememberScrollState(),
     initialGoodScroll: Int = 0,
     isMarkdown: Boolean = false,
+    /** 是否显示 Markdown 语法参考占位（仅 Markdown 空白文件显示，与语法高亮开关解耦） */
+    showMarkdownPlaceholder: Boolean = false,
     isDarkTheme: Boolean = false,
     searchQuery: String = "",
     searchMatches: List<Int> = emptyList(),
@@ -1068,6 +1074,10 @@ private fun EditContentView(
             if (isDarkTheme) MarkdownSyntaxHighlighter.SyntaxColors.dark()
             else MarkdownSyntaxHighlighter.SyntaxColors.light()
         )
+    }
+    // 离开组合时取消未完成的异步高亮计算，防对脱离组合的状态写入
+    DisposableEffect(markdownHighlighter) {
+        onDispose { markdownHighlighter.cancelPending() }
     }
 
     // 搜索高亮 / 语法高亮：搜索优先
@@ -1168,7 +1178,7 @@ private fun EditContentView(
                 },
                 decorationBox = { innerTextField ->
                     Box {
-                        if (textFieldValue.text.isEmpty()) {
+                        if (textFieldValue.text.isEmpty() && showMarkdownPlaceholder) {
                             Text(
                                 text = placeholderText,
                                 style = MaterialTheme.typography.bodyMedium.copy(
@@ -1360,7 +1370,7 @@ private fun buildShareIntent(
             else -> return null
         }
         Intent(Intent.ACTION_SEND).apply {
-            type = "text/*"
+            type = resolveShareMimeType(fileName)
             putExtra(Intent.EXTRA_SUBJECT, fileName)
             putExtra(Intent.EXTRA_STREAM, shareUri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

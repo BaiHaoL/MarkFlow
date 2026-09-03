@@ -14,6 +14,8 @@ import kotlinx.coroutines.withContext
  *
  * 相对旧实现（每页重开流 + 从头跳过 N 页，O(n)）的关键改进：
  * - 按字节分块（约 [chunkTargetBytes]），块边界落在换行处，不把行拆开；
+ *   且边界按编码单元对齐（UTF-16 取 2 字节边界、UTF-8 硬截断回退完整字符），
+ *   杜绝块首从字符中间开始解码导致的整块错位乱码；
  * - 块偏移索引 [chunkOffsets] 惰性构建：只索引已访问过的块，打开文件不预扫全文，
  *   跳块直接 seek 到块起始字节偏移，O(1)；
  * - 单行超长（如压缩日志）超过 [MAX_LINE_BYTES] 强制截断成独立块，防止单块膨胀；
@@ -200,13 +202,15 @@ class PagedTextSource(
         }
     }
 
-    /** 从 [start] 读取一块字节（边界落在换行处，见类注释），失败返回 null */
+    /** 从 [start] 读取一块字节（边界落在换行处且按编码单元对齐，见类注释），失败返回 null */
     private fun readChunkLocked(start: Long): ByteArray? {
         val reader = open() ?: return null
         try {
             val out = ByteArrayOutputStream()
             val buf = ByteArray(READ_BUF)
             var total = 0
+            // 换行搜索的起点游标：每轮只扫描新增字节（回退 1 字节防 UTF-16 换行对跨界）
+            var scanFrom = -1
             while (true) {
                 val n = reader.read(buf, start + total, READ_BUF)
                 if (n <= 0) break
@@ -214,12 +218,14 @@ class PagedTextSource(
                 total += n
                 if (total >= chunkTargetBytes) {
                     val bytes = out.toByteArray()
-                    // 从目标字节数之后找第一个换行作为块边界
-                    val nl = indexOfNewline(bytes, chunkTargetBytes)
-                    if (nl >= 0) return bytes.copyOf(nl + 1)
-                    if (total >= MAX_LINE_BYTES) return bytes
+                    val from = if (scanFrom < 0) chunkTargetBytes else scanFrom
+                    // 从目标字节数之后找第一个换行作为块边界（按编码对齐）
+                    val end = newlineAlignedEnd(bytes, from)
+                    if (end > 0) return bytes.copyOf(end)
+                    scanFrom = (total - 1).coerceAtLeast(chunkTargetBytes)
+                    if (total >= MAX_LINE_BYTES) return alignHardCut(bytes)
                 } else if (total >= MAX_LINE_BYTES) {
-                    return out.toByteArray()
+                    return alignHardCut(out.toByteArray())
                 }
             }
             return if (total == 0) ByteArray(0) else out.toByteArray()
@@ -228,15 +234,92 @@ class PagedTextSource(
         }
     }
 
-    private fun indexOfNewline(bytes: ByteArray, from: Int): Int {
-        var i = from.coerceAtLeast(0)
+    /**
+     * 从 [from] 起查找换行序列，返回块边界（保留字节数，含换行本身）；找不到返回 -1。
+     *
+     * 边界必须落在编码单元上，否则下一块会从字符中间开始解码（UTF-16 整块错位乱码）：
+     * - UTF-16LE：换行为 `0A 00`（偶偏移对齐），边界 = 换行起始 + 2；
+     * - UTF-16BE：换行为 `00 0A`（偶偏移对齐），边界 = 换行起始 + 2；
+     * - 其他（UTF-8/GBK 等）：换行为单字节 `0A`（UTF-8 多字节序列、GBK 尾字节
+     *   均不含 0x0A，不会误判），边界 = 位置 + 1。
+     *
+     * UTF-16 的"偶偏移"成立前提：BOM 长度为 0 或 2（偶），且所有块长均为偶数——
+     * 本函数与 [alignHardCut] 共同保证该不变式。
+     */
+    private fun newlineAlignedEnd(bytes: ByteArray, from: Int): Int {
+        val cs = resolvedCharset ?: Charsets.UTF_8
         val n = bytes.size
+        if (isUtf16(cs)) {
+            val le = isUtf16Le(cs)
+            var i = from.coerceAtLeast(0)
+            // 换行对必须起始于编码单元边界（偶偏移）
+            if (i % 2 != 0) i++
+            while (i + 1 < n) {
+                val b0 = bytes[i]
+                val b1 = bytes[i + 1]
+                if (le) {
+                    if (b0 == 0x0A.toByte() && b1 == 0x00.toByte()) return i + 2
+                } else {
+                    if (b0 == 0x00.toByte() && b1 == 0x0A.toByte()) return i + 2
+                }
+                i += 2
+            }
+            return -1
+        }
+        var i = from.coerceAtLeast(0)
         while (i < n) {
-            if (bytes[i] == '\n'.code.toByte()) return i
+            if (bytes[i] == '\n'.code.toByte()) return i + 1
             i++
         }
         return -1
     }
+
+    /**
+     * 超长行硬截断时回退到完整字符边界，避免把多字节字符从中间切开：
+     * - UTF-16：向下取偶（2 字节编码单元）；
+     * - UTF-8：末尾若为不完整多字节序列则整体回退（最多 3 字节）；
+     * - GBK/GB18030：首/尾字节范围重叠无法可靠回退，保持原样，
+     *   解码端 REPLACE 最多在接缝处产生一个替换符，可接受。
+     */
+    private fun alignHardCut(bytes: ByteArray): ByteArray {
+        val cs = resolvedCharset ?: Charsets.UTF_8
+        var end = bytes.size
+        when {
+            isUtf16(cs) -> {
+                end = end and 1.inv()
+            }
+            isUtf8(cs) -> {
+                var i = end - 1
+                var cont = 0
+                while (i >= 0 && (bytes[i].toInt() and 0xC0) == 0x80 && cont < 3) {
+                    cont++
+                    i--
+                }
+                if (i >= 0 && cont in 1..3) {
+                    val lead = bytes[i].toInt() and 0xFF
+                    val need = when {
+                        lead and 0xE0 == 0xC0 -> 2
+                        lead and 0xF0 == 0xE0 -> 3
+                        lead and 0xF8 == 0xF0 -> 4
+                        else -> 1
+                    }
+                    if (cont + 1 < need) end = i
+                }
+            }
+        }
+        // 防御：回退结果不得为空块（空块会被误判为 EOF）
+        if (end <= 0) return bytes
+        return if (end >= bytes.size) bytes else bytes.copyOf(end)
+    }
+
+    private fun isUtf16(cs: Charset): Boolean =
+        cs.name().uppercase().startsWith("UTF-16")
+
+    private fun isUtf16Le(cs: Charset): Boolean =
+        cs.name().uppercase().endsWith("LE")
+
+    private fun isUtf8(cs: Charset): Boolean =
+        cs.name().uppercase().replace("_", "-").startsWith("UTF-8")
 
     /** 惰性解析并缓存编码与 BOM，仅初始化一次 */
     private fun resolveEncodingLocked() {

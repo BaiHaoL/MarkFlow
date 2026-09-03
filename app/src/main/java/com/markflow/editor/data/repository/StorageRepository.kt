@@ -7,6 +7,7 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.app.RecoverableSecurityException
 import android.os.Build
 import android.os.Environment
 import android.provider.DocumentsContract
@@ -16,14 +17,19 @@ import android.provider.OpenableColumns
 import com.markflow.editor.domain.model.FileSource
 import com.markflow.editor.domain.model.FileType
 import com.markflow.editor.domain.model.MarkdownFile
+import com.markflow.editor.domain.model.PendingFileOperation
+import com.markflow.editor.domain.model.SecurityConsentRequiredException
 import com.markflow.editor.domain.model.SortMode
 import com.markflow.editor.util.EncodingDetector
 import com.markflow.editor.util.RandomSeekReader
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
+import java.util.Collections
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -120,17 +126,44 @@ class StorageRepository @Inject constructor(
             MediaStore.Files.FileColumns.MIME_TYPE
         )
 
-        val selection = "${MediaStore.Files.FileColumns.MIME_TYPE} LIKE ? OR " +
-                "${MediaStore.Files.FileColumns.MIME_TYPE} = ? OR " +
-                "${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ? OR " +
-                "${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?"
+        val mimeCol = MediaStore.Files.FileColumns.MIME_TYPE
+        val nameCol = MediaStore.Files.FileColumns.DISPLAY_NAME
+        val relPathCol = MediaStore.Files.FileColumns.RELATIVE_PATH
 
-        val selectionArgs = arrayOf(
-            "text/%",
-            "application/octet-stream",
-            "%.md",
-            "%.markdown"
-        )
+        // 白名单（OR）：MIME 为 text/* 或 octet-stream，或文件名以受支持后缀结尾。
+        // 后缀匹配必须覆盖全部受支持后缀（FileType.ALL_EXTENSIONS），
+        // 否则重命名改后缀后（如 .md -> .json）文件会因 MIME 变化而从列表消失。
+        val whitelist = buildList {
+            add("$mimeCol LIKE ?")
+            add("$mimeCol = ?")
+            FileType.ALL_EXTENSIONS.forEach { add("$nameCol LIKE ?") }
+        }
+        val whitelistArgs = buildList {
+            add("text/%")
+            add("application/octet-stream")
+            FileType.ALL_EXTENSIONS.forEach { add("%.$it") }
+        }
+
+        // 排除媒体文件（AND）：.ts 视频等 MIME 为 video/audio/image 的文件不显示。
+        // MIME 为 null 时放行，避免误杀仅靠后缀匹配的文本文件。
+        val mediaExclusion = listOf("video/%", "audio/%", "image/%")
+            .joinToString(" AND ") { "($mimeCol IS NULL OR $mimeCol NOT LIKE ?)" }
+        val mediaArgs = listOf("video/%", "audio/%", "image/%")
+
+        // 仅扫描文档目录（AND，Android 10+）：Documents/、Download/，禁止全盘扫描
+        val dirClause = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            " AND ($relPathCol LIKE ? OR $relPathCol LIKE ?)"
+        } else {
+            ""
+        }
+        val dirArgs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            listOf("Documents/%", "Download/%")
+        } else {
+            emptyList()
+        }
+
+        val selection = "(${whitelist.joinToString(" OR ")}) AND ($mediaExclusion)$dirClause"
+        val selectionArgs = whitelistArgs + mediaArgs + dirArgs
 
         var cursor: Cursor?
         try {
@@ -138,40 +171,59 @@ class StorageRepository @Inject constructor(
                 collection,
                 projection,
                 selection,
-                selectionArgs,
+                selectionArgs.toTypedArray(),
                 null
             )
 
             cursor?.use {
                 val idCol = it.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
-                val nameCol = it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                val nameColIdx = it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
                 val dataCol = it.getColumnIndex(MediaStore.Files.FileColumns.DATA)
                 val dateCol = it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED)
                 val sizeCol = it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE)
+                val mimeColIdx = it.getColumnIndex(MediaStore.Files.FileColumns.MIME_TYPE)
 
                 while (it.moveToNext()) {
-                    val fileName = it.getString(nameCol)
-                    // 仅处理支持的文件类型
-                    val fileType = FileType.resolve(fileName) ?: continue
+                    // 行级容错：单行脏数据（如 DISPLAY_NAME 为 null）只跳过该行，
+                    // 不允许整次扫描中断（否则极端 ROM 上一行脏数据即可让列表变空/截断）
+                    try {
+                        val fileName = it.getString(nameColIdx) ?: continue
+                        // 仅处理支持的文件类型
+                        val fileType = FileType.resolve(fileName) ?: continue
 
-                    val id = it.getLong(idCol)
-                    val filePath = if (dataCol >= 0) it.getString(dataCol) ?: "" else ""
-                    val dateModified = it.getLong(dateCol) * 1000L // 转换为毫秒
-                    val fileSize = it.getLong(sizeCol)
+                        // 兜底：排除媒体文件（SQL 层已过滤，此处双保险）
+                        if (mimeColIdx >= 0) {
+                            val mime = it.getString(mimeColIdx) ?: ""
+                            if (mime.startsWith("video/") || mime.startsWith("audio/") || mime.startsWith("image/")) {
+                                continue
+                            }
+                            // 部分 ROM 下 .ts 视频 MIME 为 null，按后缀二次兜底排除
+                            if (mime.isEmpty() && fileName.endsWith(".ts", ignoreCase = true)) {
+                                continue
+                            }
+                        }
 
-                    val uri = ContentUris.withAppendedId(collection, id).toString()
+                        val id = it.getLong(idCol)
+                        val filePath = if (dataCol >= 0) it.getString(dataCol) ?: "" else ""
+                        val dateModified = it.getLong(dateCol) * 1000L // 转换为毫秒
+                        val fileSize = it.getLong(sizeCol)
 
-                    files.add(
-                        MarkdownFile(
-                            uri = uri,
-                            fileName = fileName,
-                            filePath = filePath,
-                            lastModified = dateModified,
-                            fileSize = fileSize,
-                            isMarkdown = fileType.isMarkdown,
-                            grammarName = fileType.grammarName
+                        val uri = ContentUris.withAppendedId(collection, id).toString()
+
+                        files.add(
+                            MarkdownFile(
+                                uri = uri,
+                                fileName = fileName,
+                                filePath = filePath,
+                                lastModified = dateModified,
+                                fileSize = fileSize,
+                                isMarkdown = fileType.isMarkdown,
+                                grammarName = fileType.grammarName
+                            )
                         )
-                    )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "跳过 MediaStore 异常行", e)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -184,13 +236,16 @@ class StorageRepository @Inject constructor(
 
     /**
      * 扫描传统文件系统目录（兼容 Android 9 及以下）
+     * 仅扫描 Documents/ 与 Download/ 文档目录，禁止全盘扫描
      */
     private fun scanLegacyDirectory(): List<MarkdownFile> {
         val files = mutableListOf<MarkdownFile>()
 
         try {
-            val rootDir = Environment.getExternalStorageDirectory()
-            scanDirectoryRecursive(rootDir, files)
+            val documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            scanDirectoryRecursive(documentsDir, files)
+            scanDirectoryRecursive(downloadsDir, files)
         } catch (e: Exception) {
             Log.e(TAG, "Operation failed", e)
         }
@@ -648,33 +703,58 @@ class StorageRepository @Inject constructor(
     // ==================== 文件删除 ====================
 
     /**
-     * 删除文件（支持批量删除）
+     * 删除文件（支持批量删除）。并发执行 + 分批控制，减少大量文件删除时的卡顿。
      *
      * @param uris 要删除的文件 URI 列表
-     * @return 成功删除的数量
+     * @return 成功删除的文件 URI 集合
      */
-    suspend fun deleteFiles(uris: List<String>): Int = withContext(Dispatchers.IO) {
-        var deletedCount = 0
-        for (uriString in uris) {
-            try {
-                val uri = Uri.parse(uriString)
-                when {
-                    uri.scheme == "file" -> {
-                        // file:// URI：直接删除文件（用于应用私有目录下的导入文件）
-                        val file = File(uri.path ?: continue)
-                        if (file.exists() && file.delete()) deletedCount++
-                    }
-                    else -> {
-                        // content:// URI：通过 ContentResolver 删除
-                        val rows = context.contentResolver.delete(uri, null, null)
-                        if (rows > 0) deletedCount++
+    suspend fun deleteFiles(uris: List<String>): Set<String> = withContext(Dispatchers.IO) {
+        val batchSize = 16
+        val succeeded = Collections.synchronizedSet(mutableSetOf<String>())
+        val consentExceptions = Collections.synchronizedList(mutableListOf<SecurityConsentRequiredException>())
+        uris.chunked(batchSize).forEach { batch ->
+            batch.map { uriString ->
+                async {
+                    try {
+                        val uri = Uri.parse(uriString)
+                        val ok = when {
+                            uri.scheme == "file" -> {
+                                val file = File(uri.path ?: return@async)
+                                file.exists() && file.delete()
+                            }
+                            else -> {
+                                context.contentResolver.delete(uri, null, null) > 0
+                            }
+                        }
+                        if (ok) succeeded.add(uriString)
+                    } catch (e: RecoverableSecurityException) {
+                        consentExceptions.add(
+                            SecurityConsentRequiredException(
+                                e.userAction.actionIntent.intentSender,
+                                PendingFileOperation.Delete(listOf(uriString))
+                            )
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Operation failed", e)
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Operation failed", e)
-            }
+            }.awaitAll()
         }
-        deletedCount
+        // 如有需要用户授权的操作，汇总后抛给 UI 层处理：
+        // - pendingOperation 携带全部待授权 URI，授权重试可覆盖整批（而非只重试第一个）；
+        // - partialSucceeded 携带已成功删除的 URI，UI 层须先把它们从列表移除，
+        //   否则已删文件仍显示在列表中（UI 与磁盘状态不一致）。
+        consentExceptions.firstOrNull()?.let { first ->
+            val allConsentUris = consentExceptions.flatMap {
+                (it.pendingOperation as? PendingFileOperation.Delete)?.uris ?: emptyList()
+            }
+            throw SecurityConsentRequiredException(
+                first.intentSender,
+                PendingFileOperation.Delete(allConsentUris),
+                succeeded
+            )
+        }
+        succeeded
     }
 
     // ==================== 文件重命名 ====================
@@ -695,7 +775,9 @@ class StorageRepository @Inject constructor(
         withContext(Dispatchers.IO) {
             try {
                 val uri = Uri.parse(uriString)
-                val fullNewName = sanitizeFileName(newName)
+                // 方案2：重命名完全尊重用户输入（含后缀），不再强制补 .md；
+                // 无后缀即无后缀，改后缀即改后缀
+                val fullNewName = newName.trim()
 
                 // 校验文件名合法性
                 validateFileName(fullNewName).getOrThrow()
@@ -755,14 +837,22 @@ class StorageRepository @Inject constructor(
     private fun renameFileViaContentProvider(uri: Uri, fullNewName: String): Result<Unit> {
         // 路径 2a：MediaStore API（适用于 content://media/... URI）
         try {
-            val rows = context.contentResolver.update(
-                uri,
-                ContentValues().apply {
-                    put(MediaStore.Files.FileColumns.DISPLAY_NAME, fullNewName)
-                },
-                null, null
-            )
+            val contentValues = ContentValues().apply {
+                put(MediaStore.Files.FileColumns.DISPLAY_NAME, fullNewName)
+                // 同步更新 MIME_TYPE，防止 MediaStore 因原 MIME（如 text/markdown）
+                // 与新扩展名不匹配而自动追加原扩展名（例如 2255.cpp -> 2255.cpp.md）
+                put(MediaStore.Files.FileColumns.MIME_TYPE, inferMimeType(fullNewName))
+            }
+            val rows = context.contentResolver.update(uri, contentValues, null, null)
             if (rows > 0) return Result.success(Unit)
+        } catch (e: RecoverableSecurityException) {
+            // Android 11+ 非本应用创建文件需要用户授权
+            return Result.failure(
+                SecurityConsentRequiredException(
+                    e.userAction.actionIntent.intentSender,
+                    PendingFileOperation.Rename(uri.toString(), fullNewName)
+                )
+            )
         } catch (e: SecurityException) {
             // MediaStore 无权限，尝试 DocumentsContract
         }
@@ -770,11 +860,31 @@ class StorageRepository @Inject constructor(
         // 路径 2b：DocumentsContract API（适用于 content://com.android.externalstorage.documents/... URI）
         return try {
             if (DocumentsContract.isDocumentUri(context, uri)) {
+                // 部分 DocumentProvider 会根据 MIME 强制校验/追加扩展名，
+                // 先尝试同步更新 MIME_TYPE，再执行重命名
+                try {
+                    context.contentResolver.update(
+                        uri,
+                        ContentValues().apply {
+                            put(DocumentsContract.Document.COLUMN_MIME_TYPE, inferMimeType(fullNewName))
+                        },
+                        null, null
+                    )
+                } catch (e: Exception) {
+                    // Provider 不支持更新 MIME，继续尝试重命名
+                }
                 DocumentsContract.renameDocument(context.contentResolver, uri, fullNewName)
                 Result.success(Unit)
             } else {
                 Result.failure(IOException("不支持的文件类型，无法重命名"))
             }
+        } catch (e: RecoverableSecurityException) {
+            Result.failure(
+                SecurityConsentRequiredException(
+                    e.userAction.actionIntent.intentSender,
+                    PendingFileOperation.Rename(uri.toString(), fullNewName)
+                )
+            )
         } catch (e: FileNotFoundException) {
             Result.failure(FileNotFoundException("文件不存在或已被删除"))
         } catch (e: SecurityException) {
@@ -794,11 +904,49 @@ class StorageRepository @Inject constructor(
     }
 
     /**
+     * 根据文件名推断 MIME 类型，用于重命名时同步更新 MediaStore 的 MIME_TYPE，
+     * 避免系统因 MIME 与扩展名不匹配而自动追加原扩展名。
+     */
+    private fun inferMimeType(fileName: String): String {
+        return when (fileName.substringAfterLast('.', "").lowercase()) {
+            "md", "markdown" -> "text/markdown"
+            "txt", "log" -> "text/plain"
+            "html", "htm" -> "text/html"
+            "css" -> "text/css"
+            "xml" -> "text/xml"
+            "js", "mjs" -> "application/javascript"
+            "json", "jsonc" -> "application/json"
+            "yaml", "yml" -> "application/x-yaml"
+            "toml" -> "application/toml"
+            "csv" -> "text/csv"
+            "diff", "patch" -> "text/x-diff"
+            "sh", "bash", "zsh" -> "application/x-sh"
+            "py" -> "text/x-python"
+            "java" -> "text/x-java-source"
+            "kt", "kts" -> "text/x-kotlin"
+            "cpp", "cc", "cxx", "hpp", "hxx" -> "text/x-c++src"
+            "c", "h" -> "text/x-csrc"
+            "go" -> "text/x-go"
+            "rs" -> "text/rust"
+            "swift" -> "text/x-swift"
+            "dart" -> "text/x-dart"
+            "php" -> "text/x-php"
+            "rb" -> "text/x-ruby"
+            "lua" -> "text/x-lua"
+            "sql" -> "application/sql"
+            "ini", "conf", "cfg" -> "text/plain"
+            "properties", "env" -> "text/plain"
+            "dockerfile", "docker" -> "text/plain"
+            else -> "application/octet-stream"
+        }
+    }
+
+    /**
      * 校验文件名合法性
      * @throws IllegalArgumentException 文件名不合法时抛出
      */
     private fun validateFileName(fileName: String): Result<String> {
-        val nameWithoutExt = fileName.removeSuffix(".md").removeSuffix(".MD")
+        val nameWithoutExt = fileName.substringBeforeLast(".", fileName)
 
         // 空文件名
         if (nameWithoutExt.isBlank()) {

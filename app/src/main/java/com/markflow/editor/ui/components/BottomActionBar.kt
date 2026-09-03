@@ -14,13 +14,13 @@ import androidx.compose.ui.unit.dp
  *
  * 显示逻辑：
  * - 单选（selectedCount == 1）→ 分享、重命名、详细信息、删除 均可用
- * - 多选（selectedCount > 1）→ 仅删除可用，分享/重命名/详细信息置灰不可点击
+ * - 多选（selectedCount > 1）→ 分享、删除可用（多文件分享），重命名/详细信息置灰不可点击
  *
  * 注：退出选择模式的「×」按钮位于顶部 SelectionTopBar，底部不再重复放置。
  *
  * @param selectedCount 已选中的文件数量
  * @param onDelete 删除回调
- * @param onShare 分享回调（仅单选时有效）
+ * @param onShare 分享回调（单选/多选均有效）
  * @param onRename 重命名回调（仅单选时有效）
  * @param onDetails 详细信息回调（仅单选时有效）
  */
@@ -45,9 +45,10 @@ fun BottomActionBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.End
         ) {
+            // 分享（单选/多选均可用）
             TextButton(
                 onClick = onShare,
-                enabled = isSingleSelection
+                enabled = selectedCount > 0
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Share,
