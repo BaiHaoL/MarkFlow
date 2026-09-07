@@ -39,10 +39,8 @@ sealed class MarkdownSection {
  *
  * @param language 语言标识（如 "kotlin", "bash"），可能为空
  * @param rawCode 原始代码文本（不含围栏标记），用于复制
- * @param lineCount 代码行数
  */
 data class CodeBlockInfo(
     val language: String,
-    val rawCode: String,
-    val lineCount: Int = rawCode.lines().size
+    val rawCode: String
 )

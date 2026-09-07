@@ -17,9 +17,10 @@ import com.markflow.editor.util.TocParser
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.nio.charset.Charset
-import java.util.UUID
 import javax.inject.Inject
 
 /**
@@ -63,6 +64,8 @@ data class EditorUiState(
     val grammarName: String = "markdown",
     /** 是否为 .txt 文件（决定是否有纯文本预览切换） */
     val isTxt: Boolean = false,
+    /** 文件扩展名（小写，不含点；空 = 无扩展名），供 UI 按类型选择空白占位模板 */
+    val fileExtension: String = "",
     /** 当前文件的文本编码名（如 UTF-8 / GBK），供展示与手动切换；空 = 未识别 */
     val encodingName: String = "",
     // 大文件（txt / md）只读分页 + 分段编辑
@@ -117,6 +120,8 @@ class EditorViewModel @Inject constructor(
     // ==================== 自动保存 ====================
     /** 3 秒防抖：停止输入 3 秒后自动保存，与撤销防抖（500ms）独立 */
     private var autoSaveJob: Job? = null
+    /** 所有写盘共用一把锁，保证自动保存与手动保存的磁盘写入串行、不互相交错 */
+    private val saveMutex = Mutex()
 
     // ==================== 大 TXT 只读分页阅读 ====================
     private var pagedReader: PagedTextSource? = null
@@ -166,13 +171,14 @@ class EditorViewModel @Inject constructor(
         val fileType = FileType.resolve(fileName)
         val isMarkdown = fileType?.isMarkdown ?: false
         val grammarName = fileType?.grammarName ?: ""
-        // 大文件判定：.txt > 0.5MB、.md > 1MB 均直接当大 txt 处理——走分页只读浏览 + 分段编辑，
-        // 全文不载入内存（根除超长 md 全文载入/语法高亮导致的卡顿与崩溃）
+        // 大文件判定：任何文本文件（txt/md/代码/配置/日志，含未注册/无扩展名兜底）> 512KB
+        // 均直接当大 txt 处理——走分页只读浏览 + 分段编辑，全文不载入内存
+        //（根除超长文件全文载入/语法高亮导致的卡顿与崩溃）
         val isTxt = fileName.substringAfterLast('.', "").equals("txt", ignoreCase = true)
+        val fileExtension = fileName.substringAfterLast('.', "").lowercase()
         val fileSize = fileRepository.getFileSize(fileUri) ?: 0L
-        val isLargeTxt = isTxt && fileSize > LARGE_FILE_THRESHOLD_BYTES
         val isLargeMd = isMarkdown && fileSize > LARGE_MD_THRESHOLD_BYTES
-        val isPaged = isLargeTxt || isLargeMd
+        val isPaged = fileSize > LARGE_FILE_THRESHOLD_BYTES
         _uiState.update {
             it.copy(
                 fileUri = fileUri,
@@ -181,6 +187,7 @@ class EditorViewModel @Inject constructor(
                 isMarkdown = isMarkdown,
                 grammarName = grammarName,
                 isTxt = isTxt,
+                fileExtension = fileExtension,
                 encodingName = encodingOverride?.name() ?: "",
                 isReadOnlyPaged = isPaged,
                 isLargeMd = isLargeMd,
@@ -865,21 +872,25 @@ class EditorViewModel @Inject constructor(
     }
 
     fun saveFile() {
-        val state = _uiState.value
-        if (state.isSaving || !state.hasUnsavedChanges) return
+        val fileUri = _uiState.value.fileUri
+        if (_uiState.value.isSaving || !_uiState.value.hasUnsavedChanges) return
+        autoSaveJob?.cancel()
         viewModelScope.launch {
             _uiState.update { it.copy(isSaving = true, saveStatus = "保存中…") }
             try {
-                val success = fileRepository.saveContent(state.fileUri, state.currentContent)
+                val content = _uiState.value.currentContent        // 写盘前再读最新值
+                val success = saveMutex.withLock {
+                    fileRepository.saveContent(fileUri, content)
+                }
                 if (success) {
                     fileRepository.notifyFileChanged()
                     // TOC 解析移到后台线程
                     val tocEntries = withContext(Dispatchers.Default) {
-                        TocParser.parse(state.currentContent)
+                        TocParser.parse(content)
                     }
                     _uiState.update {
                         it.copy(
-                            originalContent = it.currentContent,
+                            originalContent = content,
                             hasUnsavedChanges = false,
                             isSaving = false,
                             saveStatus = "已保存",
@@ -906,8 +917,10 @@ class EditorViewModel @Inject constructor(
         // 无未保存内容或正在手动保存时跳过
         if (!state.hasUnsavedChanges || state.isSaving || state.fileUri.isEmpty()) return
         try {
-            withContext(Dispatchers.IO) {
-                fileRepository.saveContent(state.fileUri, state.currentContent)
+            saveMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    fileRepository.saveContent(state.fileUri, state.currentContent)
+                }
             }
             fileRepository.notifyFileChanged()
             // 更新基准线：后续撤回/反撤回通过比较 originalContent 判断 hasUnsavedChanges
@@ -947,7 +960,7 @@ class EditorViewModel @Inject constructor(
         if (!_uiState.value.hasUnsavedChanges) {
             val cs = when {
                 name.equals("auto", ignoreCase = true) -> null
-                else -> runCatching { Charset.forName(name) }.getOrNull() ?: null
+                else -> runCatching { Charset.forName(name) }.getOrNull()
             }
             encodingOverride = cs
             loadFile(_uiState.value.fileUri, resetEncoding = false)
@@ -1154,6 +1167,7 @@ class EditorViewModel @Inject constructor(
         viewModelScope.launch {
             // 先关闭弹窗，避免保存期间弹窗悬停
             _uiState.update { it.copy(showExitConfirmDialog = false) }
+            autoSaveJob?.cancel()
             val state = _uiState.value
             if (!state.hasUnsavedChanges || state.isSaving) {
                 onApproved()
@@ -1196,16 +1210,23 @@ class EditorViewModel @Inject constructor(
             // 普通文件保存逻辑
             _uiState.update { it.copy(isSaving = true, saveStatus = "保存中…") }
             try {
-                val success = fileRepository.saveContent(state.fileUri, state.currentContent)
+                val content = _uiState.value.currentContent      // 写盘前再读最新值
+                val success = saveMutex.withLock {
+                    fileRepository.saveContent(state.fileUri, content)
+                }
                 if (success) {
                     fileRepository.notifyFileChanged()
+                    // TOC 解析移到后台线程，避免退出保存时主线程卡顿（与 saveFile 对齐）
+                    val tocEntries = withContext(Dispatchers.Default) {
+                        TocParser.parse(content)
+                    }
                     _uiState.update {
                         it.copy(
-                            originalContent = it.currentContent,
+                            originalContent = content,
                             hasUnsavedChanges = false,
                             isSaving = false,
                             saveStatus = "已保存",
-                            tocEntries = TocParser.parse(it.currentContent)
+                            tocEntries = tocEntries
                         )
                     }
                 } else {
@@ -1263,22 +1284,9 @@ class EditorViewModel @Inject constructor(
         undoDebounceJob?.cancel()
         autoSaveJob?.cancel()
         scrollSaveJob?.cancel()
-        // 强兜底：滚动期间防抖 job 可能被清理而未把最新位置落盘，这里用
-        // 主线程同步记录的"最后可见块索引"阻塞解析偏移并写盘，避免由于竞态
-        // 把阅读位置丢回顶部。短阻塞（一次 seek）在退出场景可接受。
+        // 强兜底：滚动期间防抖 job 可能被清理而未把最新位置落盘。避免在 onCleared 里
+        // 用 runBlocking 阻塞主线程（慢存储上可能 ANR），直接写缓存的最新字节偏移。
         val uri = _uiState.value.fileUri
-        if (lastPagedScrollBlockIndex >= 0) {
-            val reader = pagedReader
-            if (reader != null) {
-                val off = runCatching {
-                    kotlinx.coroutines.runBlocking { reader.chunkOffsetOf(lastPagedScrollBlockIndex) }
-                }.getOrNull()
-                if (off != null) {
-                    runCatching { preferencesManager.savePagedReadPosition(uri, off) }
-                    return
-                }
-            }
-        }
         lastPagedScrollByteOffset?.let {
             runCatching { preferencesManager.savePagedReadPosition(uri, it) }
         }

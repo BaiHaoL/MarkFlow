@@ -77,7 +77,7 @@ object AutoTextFormatter {
 
             // 空列表项：清除标记并移除上一行标记
             if (content.isBlank()) {
-                return clearEmptyListItem(text, cursorPos, lineStart, indent.length)
+                return clearEmptyListItem(text, cursorPos, lineStart)
             }
 
             // 正常续行：递增序号
@@ -95,7 +95,7 @@ object AutoTextFormatter {
             val content = match.groupValues[4]
 
             if (content.isBlank()) {
-                return clearEmptyListItem(text, cursorPos, lineStart, indent.length)
+                return clearEmptyListItem(text, cursorPos, lineStart)
             }
 
             val prefix = "${indent}${marker} [ ] "
@@ -111,7 +111,7 @@ object AutoTextFormatter {
             val content = match.groupValues[3]
 
             if (content.isBlank()) {
-                return clearEmptyListItem(text, cursorPos, lineStart, indent.length)
+                return clearEmptyListItem(text, cursorPos, lineStart)
             }
 
             val prefix = "${indent}${marker} "
@@ -142,8 +142,7 @@ object AutoTextFormatter {
     private fun clearEmptyListItem(
         text: String,
         cursorPos: Int,
-        lineStart: Int,
-        indentSize: Int
+        lineStart: Int
     ): TextFieldValue {
         // 移除列表标记行（从 lineStart 到 cursorPos，即当前行的内容）
         val before = text.substring(0, lineStart)
@@ -154,10 +153,4 @@ object AutoTextFormatter {
     }
 
     // ==================== 辅助方法 ====================
-
-    private fun findLineStart(text: String, position: Int): Int {
-        if (position <= 0 || text.isEmpty()) return 0
-        val prev = text.lastIndexOf('\n', position - 1)
-        return if (prev < 0) 0 else prev + 1
-    }
 }

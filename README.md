@@ -5,62 +5,62 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 ## 功能特性
 
 ### 文件管理
-- 自动扫描文档目录（`Documents/`、`Download/`）中的 Markdown 文件（`.md` / `.markdown`），不扫描全盘
+- 自动扫描文档目录（`Documents/`、`Download/`）中的 Markdown 及文本文件，不扫描全盘
 - 自动排除视频 / 音频 / 图片等媒体文件（如 `.ts` 视频），仅显示文本类文件
-- 支持多选文件，可批量分享、删除
-- 支持按修改时间或文件名排序
 - 文件分区：本地 / 最近打开 / 其他（非 Markdown 文本文件）
-- 多选模式：批量删除
-- 单文件操作：重命名（可修改后缀，后缀变化时弹确认提示）、查看详情、分享
+- 支持多选：批量分享、批量删除；多文件分享走 `ACTION_SEND_MULTIPLE`
+- 排序：按修改时间 / 按文件名
+- 单文件操作：重命名（可改后缀，后缀变化弹「更改扩展名」确认提示）、查看详情、分享
 - 新建文件（自定义文件名 + 后缀选择，默认 `.md`）
-- 从手机导入已有文本文档
+- 从手机导入已有文本文档（原子化写入 + 同名去重）
 - 保存文件后自动后台刷新列表，无闪烁更新
+- 外部文件来源统一净化文件名（防路径穿越）后导入应用私有目录
 
 ### 编辑器
-- 编辑 / 预览模式切换（顶部单图标互切：编辑=笔、预览=眼睛，同一位置），滚动位置记忆（切换回编辑模式时保持原位置）
-- 语法高亮提示（代码块、标题、列表等，覆盖 11 种 Markdown 元素；大文档后台线程 + 80ms 防抖异步计算，输入不卡顿）
-- 撤销 / 重做（含光标位置追踪）
-- 自动保存（编辑状态停止输入 3 秒后触发，不影响撤销/重做历史）
-- 自动格式化：列表续行（无序/有序/复选框）、缩进保留、有序列表自动编号、空列表项清理
-- 格式插件体系：Markdown、代码（语法高亮）、纯文本三种内置格式
-- 手动保存，保存状态提示（未保存 / 保存中 / 已保存）
-- 退出时未保存更改确认
-- 插入图片（自动处理相对路径，复制到 `images/` 目录）
-- 编辑模式专属功能：搜索、撤销 / 重做、插入图片按钮（图标顺序：搜索 → 撤销 → 反撤销 → 插入图片），工具按钮间隔统一
+- 编辑 / 预览模式切换（顶部单图标互切：编辑=笔、预览=眼睛，同一位置），滚动位置记忆（切回编辑模式保持原位置）
+- 语法高亮提示（代码块、标题、列表等，覆盖 11 种 Markdown 元素）；按文档大小分流：≤64K 字符同步即时计算，>64K 字符后台线程 + 80ms 防抖异步计算（输入不卡顿）；超长文档自动降级高亮（跳过列表/引用/分隔线）
+- 撤销 / 重做（含光标位置追踪），仅编辑模式显示
+- 自动保存（编辑停止输入 3 秒触发，不影响撤销/重做历史）
+- 自动格式化：列表续行（无序/有序/复选框）、缩进保留、有序列表自动编号、空列表项清理；仅 `.md` 文件启用
+- 手动保存 + 保存状态提示（未保存 / 保存中 / 已保存）
+- 退出时未保存更改确认（「保存并退出」/「放弃更改」）
+- 插入图片（复制到 `.md` 同级 `images/` 目录，压缩长边 2048px、JPEG 质量 85，命名 `{时间戳}_{随机4位}.jpg`）
+- 编辑工具栏图标顺序：**搜索 → 撤销 → 反撤销 → 插入图片**（搜索/撤销/重做/插入图片均为编辑模式专属）
 - 分段编辑兼容手写输入法（保留输入法组合区间，多笔正常成字）
-- 选中文本时自动隐藏键盘，复制框不会触发输入法弹出
+- 选中文本时自动隐藏键盘，避免复制框弹出输入法
+- 搜索：关键字匹配高亮、点击结果精确跳转并居中、关闭后保持当前位置不被光标拉回
 
 ### 预览
-- Markdown 渲染（基于 Markwon）
-- 代码块语法高亮（Prism4j，30 种语言，含自定义 bash/dockerfile/diff/typescript/toml 语法）
-- 表格、任务列表、删除线、上下标（~下标~ ^上标^）
-- LaTeX 数学公式：行内 `$...$` 和块级 `$$...$$`；行内公式带垂直对齐补偿，与中文文字视觉中心对齐
-- 图片加载（Coil）
+- Markdown 渲染（Markwon）
+- 代码块语法高亮（Prism4j，覆盖 30 种语言，含自定义 bash / dockerfile / diff / typescript / toml 语法）
+- 表格、任务列表、删除线、上下标（`~下标~` `^上标^`）
+- LaTeX 数学公式：行内 `$...$` 与块级 `$$...$$`；行内公式带垂直对齐补偿，与中文文字视觉中心对齐
+- 图片加载（Coil）；相对路径图片基于 `.md` 物理路径解析；缺失图片回退灰色占位
 - 不安全的图片 URL 自动过滤（如 Mi Notes 自定义 URI）
-- 亮色 / 暗色主题切换
+- 亮色 / 暗色主题切换（点击标题栏切换）
 
-### 搜索
-- 编辑模式下关键字搜索，匹配结果高亮
-- 点击结果精确跳转并居中显示
-- 关闭搜索后保持在当前搜索结果位置，不被光标拉回
+### 大文件支持（≥512KB，统一阈值）
+- 大文本与大 Markdown **统一按 512KB 分档**，全部走「分页只读浏览 + 分段编辑」，**不全文载入内存**（避免超大文档渲染崩溃与卡顿）
+- 浏览：连续分页只读、按需加载并回收远端分块；支持手动切换编码；阅读位置记忆（全局字节偏移锚点，防抖落盘，退出自动保存）
+- 编辑：长按某段进入该段的单块可写编辑（分页内核保证单行超长按字节切块、内存受控）
+- 大 Markdown 打开默认预览分页浏览，行为与大 TXT 完全一致；超大 md 不再触发全文渲染/高亮崩溃
 
-### 多类型文件支持
-- Markdown：`.md` `.markdown` — 完整编辑 + 预览
-- 有语法高亮：`.sh` `.bash` `.zsh` `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.hxx` `.java` `.kt` `.kts` `.js` `.mjs` `.ts` `.tsx` `.go` `.rs` `.swift` `.dart` `.php` `.rb` `.lua` `.sql` `.json` `.jsonc` `.yaml` `.yml` `.toml` `.xml` `.html` `.htm` `.css` `.scss` `.less` `.dockerfile` `.docker` `.diff` `.patch` — 编辑模式 + 代码卡片预览
-- 纯文本：`.txt` `.log` `.text` `.ini` `.conf` `.cfg` `.properties` `.env` — 仅编辑模式
-- 大文本（>0.5MB）：自动分段只读预览，按需分页加载并回收远端分块；滚动定位记忆（全局字节偏移锚点，防抖落盘，退出自动保存）
-- 大 Markdown（>1MB）：与超大文本同走分页只读浏览 + 分段编辑，全文不载入内存（避免超大文档渲染崩溃与卡顿）
+### 支持的文件类型
+- **Markdown**（`.md` `.markdown`）：完整编辑 + 预览 + TOC
+- **有语法高亮**（`.sh` `.bash` `.zsh` `.py` `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.hxx` `.java` `.kt` `.kts` `.js` `.mjs` `.ts` `.tsx` `.go` `.rs` `.swift` `.dart` `.php` `.rb` `.lua` `.sql` `.json` `.jsonc` `.yaml` `.yml` `.toml` `.xml` `.html` `.htm` `.css` `.scss` `.less` `.ini` `.conf` `.cfg` `.properties` `.env` `.dockerfile` `.docker` `.diff` `.patch`）：编辑模式 + 代码卡片预览
+- **纯文本**（`.txt` `.log` `.text`）：仅编辑模式
 
 ### 跨应用支持
 - 从文件管理器或其他应用打开文本类文件
-- 从其他应用分享文本或文件到 MarkFlow（自动复制到应用私有目录后打开）
-- 自动处理 `content://` / `file://` URI 的文件复制
+- 从其他应用分享文本 / 文件到 MarkFlow（自动复制到私有目录后打开）
+- 自动处理 `content://` / `file://` URI
 - 支持无标准 MIME 类型的文件（如 `.toml`）
+- 未注册扩展名 / 无扩展名的文件源头拒绝打开
 
 ### 其他
 - 沉浸式模式（全屏编辑）
-- 目录大纲（TOC）展示（仅查看，条目不可跳转）
-- 点击标题切换主题
+- 目录大纲（TOC）展示（仅查看，条目暂不可跳转；大 Markdown 隐藏）
+- 目录 / 阅读位置记忆
 
 ## 技术栈
 
@@ -71,39 +71,39 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 | 架构 | MVVM + Clean Architecture |
 | 依赖注入 | Hilt |
 | 异步处理 | Kotlin Coroutines + Flow |
-| Markdown 渲染 | Markwon |
+| Markdown 渲染 | Markwon（latex / tables / tasklist / strikethrough / superscript / subscript 插件） |
 | 语法高亮 | Prism4j |
+| LaTeX 渲染 | JLaTeXMath |
 | 图片加载 | Coil |
 | 导航 | Navigation Compose |
-| 文件访问 | Scoped Storage / MediaStore API |
+| 文件访问 | Scoped Storage / MediaStore / DocumentFile API |
 
 ## 项目结构
 
 ```
 com.markflow.editor
 ├── data/
-│   ├── local/          # 本地偏好存储（排序模式、主题模式）
-│   └── repository/     # 文件 I/O 仓库
+│   ├── local/          # 本地偏好存储（排序、主题）
+│   └── repository/     # 文件 I/O 仓库（扫描、读写、MediaStore/DocumentFile、编码检测、大文件分页）
 ├── domain/
-│   ├── model/          # 领域模型（EditorMode, FileType, SortMode, ThemeMode, MarkdownFile, MarkdownSection, FormatPlugin, FormatRegistry）
-│   └── util/           # 领域工具（FileSorter, UndoRedoManager）
+│   ├── model/          # 领域模型（FileType/FormatRegistry/SortMode/ThemeMode/EditorMode/MarkdownFile 等）
+│   └── util/           # 领域工具（FileSorter、UndoRedoManager）
 ├── ui/
-│   ├── components/     # 可复用组件（BottomActionBar, CodeBlockCard, MarkdownPreview, SearchBar, MarkdownSyntaxHighlighter, VerticalAlignedLatexSpan）
+│   ├── components/     # 可复用组件（BottomActionBar、CodeBlockCard、MarkdownPreview、SearchBar、MarkdownSyntaxHighlighter、VerticalAlignedLatexSpan）
 │   ├── navigation/     # 导航图与路由定义
 │   ├── screens/
-│   │   ├── editor/     # 编辑器页面 + ViewModel
+│   │   ├── editor/     # 编辑器页面 + ViewModel（含大文件分页只读 / 分段编辑）
 │   │   └── filelist/   # 文件列表页面 + ViewModel
 │   └── theme/          # Material3 主题（浅色/深色手动切换）
-├── util/               # 工具类（Markwon 配置、Markdown 分段解析、目录解析、语法高亮、自动格式化、上下标/LaTeX 对齐插件、TOC 解析、编码检测、大文本分页读取、Prism4j 自定义语法）
+├── util/               # 工具（Markwon 配置、Markdown 解析、TOC、语法高亮、自动格式化、上下标/LaTeX 对齐插件、编码检测、大文本分页读取、Prism4j 自定义语法）
 ├── io/noties/prism4j/languages/  # 自实现的 Prism4j 语法（bash, diff, dockerfile, toml, typescript）
-├── MainActivity.kt     # 主 Activity
-└── MarkFlowApp.kt      # Application 入口
+├── MainActivity.kt     # 主 Activity（Intent 分发 / 分享接入）
+└── MarkFlowApp.kt      # Application 入口（Hilt）
 ```
 
 ## 构建
 
 ### 环境要求
-
 - Android Studio Hedgehog 或更新版本
 - JDK 17
 - Android SDK 35
@@ -122,7 +122,7 @@ com.markflow.editor
 .\gradlew.bat clean
 ```
 
-#### 主要区别：
+### Debug 与 Release 区别
 
 | | Debug | Release |
 |---|---|---|
@@ -132,7 +132,7 @@ com.markflow.editor
 | 版本名 | `1.2.0-debug` | `1.2.0` |
 | 签名 | Debug 签名（自动） | Release 签名（keystore） |
 | 可调试 | 是 | 否 |
-| 日志输出 | 完整（含 verbose/debug） | 仅 error / warn（debug/info 日志被 R8 移除） |
+| 日志 | 完整 | R8 移除 `Log.v/d/i`，仅保留 `Log.w/e`（排障用） |
 
 ### 产物位置
 
@@ -166,6 +166,10 @@ keyPassword=your-key-password
 
 - `storeFile` 支持相对路径（相对于 `~/.markflow/`）或绝对路径
 - 若 `~/.markflow/keystore.properties` 不存在、缺少必需键或 keystore 文件不存在，Release 打包会**直接失败**（不会静默回退到 debug 签名）；不影响 Debug 构建与 IDE 同步
+
+### 日志策略
+- Release 用 R8（`-assumenosideeffects`）移除 `Log.v/d/i`，仅保留 `Log.w/e/wtf`
+- App 源码中的日志**全部为异常分支**（文件读写失败、MediaStore 异常、公式渲染失败等），**正常运行无错误时不产生任何日志**；错误日志量级极小且属有用排障信息，不会占用设备存储（logcat 为内存环形缓冲，不持续写盘）
 
 ## 最低要求
 

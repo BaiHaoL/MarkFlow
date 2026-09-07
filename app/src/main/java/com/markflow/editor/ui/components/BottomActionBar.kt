@@ -41,6 +41,10 @@ fun BottomActionBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                // 避让底部系统导航栏：edge-to-edge 下 bottom bar 贴屏底，三键导航（有实际高度的
+                // 虚拟键条）会遮住分享/重命名/删除。navigationBarsPadding 读系统真实 inset，
+                // 手势导航时 inset≈0 不影响。放 Surface 内部使底栏背景色铺满导航栏区、视觉无缝。
+                .navigationBarsPadding()
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.End

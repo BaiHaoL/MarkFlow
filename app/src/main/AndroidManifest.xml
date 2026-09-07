@@ -37,6 +37,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MarkFlow"
         android:requestLegacyExternalStorage="true"
+        android:largeHeap="true"
         tools:targetApi="35">
 
         <!-- 主 Activity：单任务模式，避免多实例 -->

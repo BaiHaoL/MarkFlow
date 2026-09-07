@@ -15,9 +15,13 @@ package com.markflow.editor.domain.util
  *
  * 慢速输入场景（按键间隔 > 防抖阈值）：每个字符独立推入栈，
  * 撤回时逐字符回退，与主流编辑器行为一致。
+ *
+ * 每个 Entry 存一份全量 String 快照，maxSteps 过大时大文档下内存叠加可观
+ * （50 份大文档快照可达数十 MB，低内存机上易触发 OOM）。默认 20 在保留
+ * 足够撤回历史的同时把内存占用砍半以上。
  */
 class UndoRedoManager(
-    private val maxSteps: Int = 50
+    private val maxSteps: Int = 20
 ) {
     /** 撤回栈条目：记录内容快照及对应光标位置 */
     private data class Entry(val content: String, val cursor: Int)

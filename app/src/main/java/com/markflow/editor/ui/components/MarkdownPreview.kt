@@ -57,12 +57,12 @@ import kotlinx.coroutines.launch
 @Composable
 fun MarkdownPreview(
     markdownText: String,
+    modifier: Modifier = Modifier,
     baseDir: String = "",
     isDarkTheme: Boolean = false,
     searchQuery: String = "",
     currentSearchIndex: Int = -1,
-    scrollState: ScrollState = rememberScrollState(),
-    modifier: Modifier = Modifier
+    scrollState: ScrollState = rememberScrollState()
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -87,7 +87,7 @@ fun MarkdownPreview(
     val sections = remember(processedText) {
         try {
             MarkdownParser.parse(processedText)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             listOf(
                 MarkdownSection.Text(
                     id = "parse_error",
@@ -103,7 +103,7 @@ fun MarkdownPreview(
     val markwon = remember(isDarkTheme) {
         try {
             MarkwonConfig.create(context, isDarkTheme)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             io.noties.markwon.Markwon.builder(context).build()
         }
     }
@@ -250,7 +250,7 @@ private fun MarkdownTextSectionView(
                     // 重绘，无需额外修复。
                     try {
                         MarkwonConfig.fixFormulaSpanAlignment(this)
-                    } catch (_: Exception) { }
+                    } catch (_: Throwable) { }
                 }
             }.apply {
                 setTextIsSelectable(true)
@@ -264,12 +264,12 @@ private fun MarkdownTextSectionView(
                 setTextColor(textColor)
                 try {
                     markwon.setMarkdown(this, content)
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     this.text = content
                 }
                 try {
                     MarkwonConfig.applyMissingImagePlaceholders(this, missingImagePlaceholders, missingImageGray)
-                } catch (_: Exception) { }
+                } catch (_: Throwable) { }
                 lastContent = content
                 lastMarkwon = markwon
             }
@@ -292,12 +292,12 @@ private fun MarkdownTextSectionView(
                 // 旧内容高度上测量、随后内容变化触发滚动补偿跳动的 bug。
                 try {
                     markwon.setMarkdown(textView, content)
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     textView.text = content
                 }
                 try {
                     MarkwonConfig.applyMissingImagePlaceholders(textView, missingImagePlaceholders, missingImageGray)
-                } catch (_: Exception) { }
+                } catch (_: Throwable) { }
                 if (searchQuery.isNotEmpty()) {
                     applySectionSearchHighlights(textView, searchQuery, isCurrentMatchSection)
                 }
@@ -403,7 +403,7 @@ private fun formatTableAsMarkdown(spanned: Spanned, start: Int, end: Int): Strin
 
     val cellsField = try {
         TableRowSpan::class.java.getDeclaredField("cells").apply { isAccessible = true }
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
         return null
     }
 
@@ -414,7 +414,7 @@ private fun formatTableAsMarkdown(spanned: Spanned, start: Int, end: Int): Strin
             @Suppress("UNCHECKED_CAST")
             val cells = cellsField.get(rowSpan) as? List<TableRowSpan.Cell> ?: return@mapNotNull null
             cells.map { CellData(it.text().toString().trim(), it.alignment()) }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }

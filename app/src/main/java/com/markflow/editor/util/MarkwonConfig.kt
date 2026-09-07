@@ -5,7 +5,6 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.util.TypedValue
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.text.Spannable
@@ -55,6 +54,20 @@ object MarkwonConfig {
     private var cachedLightCodeBlockMarkwon: Markwon? = null
     @Volatile
     private var cachedDarkCodeBlockMarkwon: Markwon? = null
+
+    /**
+     * 清除缓存的 Markwon 实例。
+     *
+     * 内存吃紧（onTrimMemory / onLowMemory）时调用，释放 Prism4j 语法定义等
+     * 常驻内存，降低低内存机被系统杀进程 / OOM 的概率；下次预览按需重建。
+     */
+    @Synchronized
+    fun clearCache() {
+        cachedLightMarkwon = null
+        cachedDarkMarkwon = null
+        cachedLightCodeBlockMarkwon = null
+        cachedDarkCodeBlockMarkwon = null
+    }
 
     /**
      * 创建 Markwon 实例（按主题缓存，线程安全）
@@ -125,7 +138,7 @@ object MarkwonConfig {
                     }
                 })
                 .build()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // 语法高亮初始化失败时回退到无高亮的 Markwon 实例
             Markwon.builder(context).build()
         }
@@ -141,9 +154,9 @@ object MarkwonConfig {
             val prism4j = Prism4j(AliasedGrammarLocator())
 
             // 主题配色
-            // 代码块背景色与 Prism4j Darkula 主题背景（#2D2D2D）保持一致，
-            // 确保无语言标识的代码块与有语法高亮的代码块背景色统一
-            val codeBg = if (isDarkTheme) Color.parseColor("#2D2D2D") else Color.parseColor("#F4F4F5")
+            // 文本段内（行内 / 缩进）代码块背景：深色模式对齐围栏代码卡片底 #1E1E1E，
+            // 卡片顶栏 #2D2D2D 保持不变，三者不再统一为同一色
+            val codeBg = if (isDarkTheme) Color.parseColor("#1E1E1E") else Color.parseColor("#F4F4F5")
             val codeText = if (isDarkTheme) Color.parseColor("#C9D1D9") else Color.parseColor("#24292F")
             val blockQuoteColor = if (isDarkTheme) Color.parseColor("#8AB4F8") else Color.parseColor("#1A73E8")
             val linkColor = if (isDarkTheme) Color.parseColor("#8AB4F8") else Color.parseColor("#1A73E8")
@@ -220,7 +233,7 @@ object MarkwonConfig {
                     }
                 })
                 .build()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // 语法高亮初始化失败时回退到无高亮的 Markwon 实例
             Markwon.builder(context).build()
         }
@@ -314,7 +327,7 @@ object MarkwonConfig {
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             markdown
         }
     }
@@ -347,7 +360,7 @@ object MarkwonConfig {
                 result = convertAlignedEnv(result)
                 result
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             markdown
         }
     }
@@ -479,7 +492,7 @@ object MarkwonConfig {
                 }
             }
             ImagePreprocessResult(replaced, missingPlaceholders)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             ImagePreprocessResult(markdown, emptyList())
         }
     }
@@ -499,7 +512,7 @@ object MarkwonConfig {
             if (host.isEmpty()) return true
             // 检测 Android 包名风格的 hostname
             UNSAFE_IMAGE_HOST.containsMatchIn(url)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             true
         }
     }
@@ -512,7 +525,7 @@ object MarkwonConfig {
         return try {
             val uri = Uri.parse(url)
             uri.lastPathSegment?.substringBefore('?')?.substringBefore('#') ?: ""
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             ""
         }
     }
@@ -556,7 +569,7 @@ object MarkwonConfig {
                         }
                     }
                 }
-        } catch (_: Exception) { }
+        } catch (_: Throwable) { }
         return ""
     }
 
@@ -659,7 +672,7 @@ object MarkwonConfig {
         return try {
             val method = drawable.javaClass.getMethod("isBlock")
             if ((method.invoke(drawable) as? Boolean) == true) 1 else 0
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             -1
         }
     }

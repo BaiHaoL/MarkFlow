@@ -40,15 +40,8 @@ data class MarkdownFile(
     fun formattedSize(): String {
         return when {
             fileSize < 1024 -> "$fileSize B"
-            fileSize < 1024 * 1024 -> String.format("%.1f KB", fileSize / 1024.0)
-            else -> String.format("%.1f MB", fileSize / (1024.0 * 1024.0))
+            fileSize < 1024 * 1024 -> String.format(java.util.Locale.US, "%.1f KB", fileSize / 1024.0)
+            else -> String.format(java.util.Locale.US, "%.1f MB", fileSize / (1024.0 * 1024.0))
         }
-    }
-
-    /**
-     * 获取不带扩展名的文件名
-     */
-    fun nameWithoutExtension(): String {
-        return fileName.substringBeforeLast(".", fileName)
     }
 }

@@ -8,6 +8,9 @@ package com.markflow.editor.util
  */
 object TocParser {
 
+    /** 标题匹配正则（提为常量，避免 parse 循环内每行重复编译） */
+    private val HEADING_REGEX = Regex("^(#{1,6})\\s+(.+)$")
+
     /**
      * 目录条目
      *
@@ -52,8 +55,7 @@ object TocParser {
             if (inCodeBlock) continue
 
             // 匹配标题：1~6 个 # + 空格 + 文本
-            val headingRegex = Regex("^(#{1,6})\\s+(.+)$")
-            val match = headingRegex.find(trimmed)
+            val match = HEADING_REGEX.find(trimmed)
             if (match == null) continue
 
             val level = match.groupValues[1].length

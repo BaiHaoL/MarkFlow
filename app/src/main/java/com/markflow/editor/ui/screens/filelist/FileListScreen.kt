@@ -13,6 +13,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -49,6 +50,9 @@ import kotlinx.coroutines.delay
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+
+/** 新建文件对话框后缀选择框/下拉面板的固定宽度，需容纳最长后缀（如 .yaml）+ 箭头图标 */
+private val SUFFIX_SELECT_WIDTH = 106.dp
 
 /**
  * 文件列表首页
@@ -244,6 +248,8 @@ fun FileListScreen(
             if (!uiState.isSelectionMode) {
                 FloatingActionButton(
                     onClick = { showCreateDialog = true },
+                    // edge-to-edge 下避让底部导航栏，防止三键导航压到按钮下沿
+                    modifier = Modifier.navigationBarsPadding(),
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     contentColor = MaterialTheme.colorScheme.onPrimaryContainer
                 ) {
@@ -521,7 +527,7 @@ fun FileListScreen(
                                 },
                                 singleLine = true,
                                 modifier = Modifier
-                                    .width(96.dp)
+                                    .width(SUFFIX_SELECT_WIDTH)
                                     .menuAnchor()
                             )
                         }
@@ -532,7 +538,7 @@ fun FileListScreen(
                             verticalArrangement = Arrangement.spacedBy(2.dp),
                             modifier = Modifier
                                 .align(Alignment.End)
-                                .width(96.dp)
+                                .width(SUFFIX_SELECT_WIDTH)
                                 .heightIn(max = 180.dp)
                                 .clip(MaterialTheme.shapes.medium)
                                 .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium)
@@ -908,10 +914,11 @@ private fun FileListItem(
     onLongClick: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()) }
-    // 大 TXT 判定（>0.5MB）→ 显示"大"角标（已支持分段编辑，不再是只读）
-    val isLargeTxt = remember(file.fileName, file.fileSize) {
-        file.fileName.substringAfterLast('.', "").equals("txt", ignoreCase = true) &&
-            file.fileSize > FileType.LARGE_FILE_THRESHOLD_BYTES
+    // 大文件判定（>512KB 的文本文件，含 md，统一阈值）→ 显示"大"角标。
+    // 与 EditorViewModel.loadFile 的 isPaged 判定一致，保证列表"大"标记
+    // 与实际打开行为（分页只读浏览 + 分段编辑）对齐。
+    val isLargeFile = remember(file.fileName, file.fileSize) {
+        file.fileSize > FileType.LARGE_FILE_THRESHOLD_BYTES
     }
 
     Card(
@@ -970,7 +977,7 @@ private fun FileListItem(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (isLargeTxt) {
+                    if (isLargeFile) {
                         Surface(
                             shape = RoundedCornerShape(4.dp),
                             color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.6f)
@@ -982,7 +989,6 @@ private fun FileListItem(
                                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                             )
                         }
-                        Spacer(modifier = Modifier.width(4.dp))
                     }
                     Text(
                         text = dateFormat.format(Date(file.lastModified)),
@@ -1040,10 +1046,13 @@ private fun DetailRow(label: String, value: String) {
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyMedium
-        )
+        // SelectionContainer 使详情值可长按选中复制（文件名/大小/时间/路径）
+        SelectionContainer {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium
+            )
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 package com.markflow.editor.ui.components
 
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.State
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -135,8 +136,49 @@ class MarkdownSyntaxHighlighter(
         // 分隔线：--- *** ___（独占一行）
         private val RULE_PATTERN = Regex("""^(\s*[-*_]{3,})\s*$""", RegexOption.MULTILINE)
 
-        /** 小于该字符数的文档在 filter 内同步高亮（即时体验）；超过则异步计算 */
-        private const val SYNC_THRESHOLD_CHARS = 16_000
+        // 围栏代码块标记：行首(≤3 空格) 3+ 连续反引号或波浪号，后接可选语言标识。
+        // 用于识别 ``` ``` / ~~~ ~~~ 区间，区间内屏蔽所有语法高亮（代码区保持纯文本）。
+        private val FENCE_PATTERN = Regex("""^[ ]{0,3}(`{3,}|~{3,})(.*)$""")
+
+        /**
+         * 小于该字符数的文档在 filter 内同步高亮（即时体验）；超过则异步计算。
+         *
+         * 原值 16_000 过低：2~3 万字符的中型 Markdown（几万字节）会被误判为"大文档"
+         * 走异步路径。异步路径若反复触发（滑动/光标跟随导致 BasicTextField 频繁重组、
+         * filter 每次未命中缓存都 cancel+restart 后台计算），80ms debounce 永远等不满，
+         * 高亮永远无法上屏，表现为"打开后无加粗/无高亮"，且主线程每次 applyBaseColor
+         * 重建整篇 AnnotatedString 造成滚动卡顿。同步路径对 11 种正则全量扫描在
+         * 数万字符上是毫秒级，远优于异步路径的抖振。故提高到 64K 覆盖中型文档；
+         * 真正的大文档（>1MB）本就不全文载入（走分页只读），不会进入本路径。
+         */
+        private const val SYNC_THRESHOLD_CHARS = 64_000
+
+        /**
+         * 超过该字符数的文档降级高亮：只做核心元素（标题/加粗/斜体/删除线/代码/链接），
+         * 跳过列表标记/引用/分隔线（span 数多、视觉影响小，实测占 23-27%）。
+         * 长文档的 StaticLayout 渲染 span 越少越流畅。
+         */
+        private const val REDUCED_HIGHLIGHT_THRESHOLD = 16_000
+
+        /**
+         * 编辑态实时高亮上限（字符数）：超过该大小的 .md 在编辑模式下不做全量语法高亮，
+         * 只保留标题高亮（结构导航），其余纯文本（预览模式仍走 Markwon 全量高亮）。
+         *
+         * 根因：编辑时每次键入 raw 都变 → highlightCache 永不命中 → 全量正则重算 +
+         * StaticLayout 全量 relayout，在低内存/中端机（荣耀 X50 骁龙6Gen1 + MagicOS
+         * 激进回收）上累积为卡顿或 OOM。Markor 官方对同类问题的解法即「大文件禁高亮」。
+         *
+         * 分层（编辑态）：≤REDUCED_HIGHLIGHT_THRESHOLD(16K) 完整 11 种高亮；16K~本值
+         * 降级高亮（7 种核心：标题/加粗/斜体/删除线/代码/链接，跳过列表/引用/分隔线）；
+         * >本值 仅标题高亮。本值取 32_000：让 16K~32K 中型文档保留降级高亮体验，32K
+         * 以上（长文档编辑开销高）才收敛到仅标题。若荣耀 X50 上 16K~32K 仍卡顿，
+         * 可下调到 16_000（=REDUCED_HIGHLIGHT_THRESHOLD）彻底只留标题。
+         *
+         * 注意：本值 < SYNC_THRESHOLD_CHARS(64K) 后，filter 内「>本值 被上方拦截直接返回」，
+         * 使下方 SYNC 异步分支不可达（dead code），保留作可逆——将来恢复大文档实时高亮，
+         * 调高本值即可。
+         */
+        private const val EDIT_LIVE_HIGHLIGHT_CHARS = 32_000
 
         /** 异步高亮 debounce（毫秒）：停止输入该时长后才在后台计算 */
         private const val HIGHLIGHT_DEBOUNCE_MS = 80L
@@ -156,12 +198,64 @@ class MarkdownSyntaxHighlighter(
     /** 快照状态：异步计算完成后自增，触发 filter 重新执行并命中缓存 */
     private val cacheVersion = mutableIntStateOf(0)
 
+    /**
+     * 异步高亮版本号（暴露给 Composable 层读取）。
+     *
+     * Composable 层将它纳入 visualTransformation 的 remember key，并在 key 变化时
+     * 创建一个新的 VisualTransformation 包装实例。BasicTextField 检测到 VT 实例
+     * 变化后会重新调用 filter，此时缓存已就绪，高亮得以正确上屏。
+     *
+     * 不能仅靠 filter 内部读取 cacheVersion 来触发重跑——VisualTransformation.filter
+     * 在布局阶段被调用，其中的 State 读取不一定能可靠地触发 filter 再次执行
+     *（表现为"长按后才有高亮"：长按改变了 selection → BasicTextField 重组 →
+     * filter 重跑 → 命中缓存 → 高亮出现）。
+     */
+    val highlightVersion: State<Int> get() = cacheVersion
+
     private var highlightJob: Job? = null
     private val highlightScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** 正在后台计算（或等待 debounce）的原始文本；用于去重，避免同一内容反复 cancel/restart */
+    private var pendingRaw: String? = null
+
+    /** 纯文本过渡态的缓存：异步计算期间 filter 会反复被调用，缓存避免主线程重复构建整篇 */
+    private var plainCacheKey: String? = null
+    private var plainCacheValue: AnnotatedString? = null
+
+    /** 「仅标题高亮」过渡态的缓存：>阈值文档每次键入 raw 变，但布局阶段同一 raw 会被反复调用 */
+    private var headingOnlyCacheKey: String? = null
+    private var headingOnlyCacheValue: AnnotatedString? = null
+
+    /**
+     * TransformedText 实例缓存（主线程 only）。
+     *
+     * 卡顿根因：filter 每次返回 new TransformedText(annotated, ...)，即使 annotated 是
+     * 同一个缓存对象，TransformedText 实例引用不等 → BasicTextField 检测到变化 →
+     * 触发 StaticLayout 全量重建（26K 字符 + 960 span 要几百 ms）→ 滑动卡顿。
+     *
+     * 修复：同一 (raw, annotated 引用) 复用同一 TransformedText 实例，BasicTextField
+     * 检测到引用相等跳过 relayout。annotated 引用变化时（纯文本→高亮）才创建新实例。
+     */
+    private var ttCacheRaw: String? = null
+    private var ttCacheAnnotated: AnnotatedString? = null
+    private var ttCacheValue: TransformedText? = null
+
+    private fun transformedText(raw: String, annotated: AnnotatedString): TransformedText {
+        // 同一 raw + 同一 annotated 引用 → 复用 TransformedText，避免触发 relayout
+        if (ttCacheRaw == raw && ttCacheAnnotated === annotated && ttCacheValue != null) {
+            return ttCacheValue!!
+        }
+        val tt = TransformedText(annotated, OffsetMapping.Identity)
+        ttCacheRaw = raw
+        ttCacheAnnotated = annotated
+        ttCacheValue = tt
+        return tt
+    }
 
     /** 取消未完成的异步计算（组件销毁时调用，防对脱离组合的状态写入） */
     fun cancelPending() {
         highlightJob?.cancel()
+        pendingRaw = null
     }
 
     // ==================== VisualTransformation 实现 ====================
@@ -170,37 +264,69 @@ class MarkdownSyntaxHighlighter(
         val raw = text.text
 
         if (raw.isEmpty()) {
-            return TransformedText(applyBaseColor(raw), OffsetMapping.Identity)
+            return transformedText(raw, applyBaseColor(raw))
         }
 
-        // 小文档：同步计算（与原行为一致，即时高亮，无感知差异）
+        // 编辑态实时高亮降级：超过阈值的文档只保留标题高亮（结构导航），其余纯文本。
+        // 标题 span 仅数十个、MULTILINE 正则扫描毫秒级，几乎无开销；全量高亮（加粗/代码/
+        // 链接等上千 span）才是每次键入全量重算 + relayout 累积卡顿/OOM 的元凶。
+        if (raw.length > EDIT_LIVE_HIGHLIGHT_CHARS) {
+            return transformedText(raw, applyHeadingOnlyCached(raw))
+        }
+
+        // 阈值内文档：同步计算（首次计算后缓存，后续 filter 调用直接命中缓存）
         if (raw.length <= SYNC_THRESHOLD_CHARS) {
-            return TransformedText(computeHighlight(raw), OffsetMapping.Identity)
+            synchronized(highlightCache) {
+                highlightCache[raw]?.let { return transformedText(raw, it) }
+            }
+            val highlighted = try {
+                computeHighlight(raw)
+            } catch (t: Throwable) {
+                // 正则回溯等异常兜底：回退纯文本，避免编辑热路径崩溃
+                return transformedText(raw, applyBaseColorCached(raw))
+            }
+            synchronized(highlightCache) {
+                highlightCache[raw] = highlighted
+            }
+            return transformedText(raw, highlighted)
         }
 
         // 大文档：命中缓存直接返回；未命中先返回纯文本（不阻塞输入），
         // 后台 + debounce 计算完成后自增版本号触发重组，再次执行时命中缓存
         cacheVersion.intValue // 订阅快照状态（本行仅读取，建立依赖）
         synchronized(highlightCache) {
-            highlightCache[raw]?.let { return TransformedText(it, OffsetMapping.Identity) }
+            highlightCache[raw]?.let { return transformedText(raw, it) }
         }
-        scheduleAsyncHighlight(raw)
-        return TransformedText(applyBaseColor(raw), OffsetMapping.Identity)
+        // 去重：同一内容已有在途计算（含 debounce 等待）时不再重复 cancel/restart。
+        // 否则滑动/光标跟随导致的频繁重组会让 debounce 永远等不满、计算永远无法完成，
+        // 表现为"始终无高亮"。
+        if (pendingRaw != raw) {
+            scheduleAsyncHighlight(raw)
+        }
+        return transformedText(raw, applyBaseColorCached(raw))
     }
 
     /** 后台 + debounce 计算大文档高亮，结果写入 LRU 缓存并触发重组 */
     private fun scheduleAsyncHighlight(raw: String) {
         highlightJob?.cancel()
+        pendingRaw = raw
         highlightJob = highlightScope.launch {
             delay(HIGHLIGHT_DEBOUNCE_MS)
-            val highlighted = computeHighlight(raw)
+            val highlighted = try {
+                computeHighlight(raw)
+            } catch (t: Throwable) {
+                // 正则回溯等异常兜底：放弃本次高亮，保持纯文本，避免后台线程崩溃
+                pendingRaw = null
+                return@launch
+            }
             synchronized(highlightCache) { highlightCache[raw] = highlighted }
+            pendingRaw = null
             // 快照状态允许跨线程写入；自增后订阅方（filter）重组并命中缓存
             cacheVersion.intValue++
         }
     }
 
-    /** 仅铺基础文本色（空文本 / 异步计算期间的过渡形态） */
+    /** 仅铺基础文本色（空文本 / 异步计算期间的过渡形态），带缓存避免主线程重复构建 */
     private fun applyBaseColor(raw: String): AnnotatedString {
         val builder = AnnotatedString.Builder(raw)
         if (raw.isNotEmpty()) {
@@ -209,36 +335,135 @@ class MarkdownSyntaxHighlighter(
         return builder.toAnnotatedString()
     }
 
-    /** 全量计算 11 种元素的语法高亮（同步路径直接调用；异步路径在后台线程调用） */
+    /** 带缓存的基础色：filter 在异步计算期间会被反复调用，缓存避免重复构建整篇 AnnotatedString */
+    private fun applyBaseColorCached(raw: String): AnnotatedString {
+        if (plainCacheKey == raw && plainCacheValue != null) return plainCacheValue!!
+        val v = applyBaseColor(raw)
+        plainCacheKey = raw
+        plainCacheValue = v
+        return v
+    }
+
+    /** 带缓存的「仅标题高亮」：>阈值文档编辑态只着色标题，其余纯文本 */
+    private fun applyHeadingOnlyCached(raw: String): AnnotatedString {
+        if (headingOnlyCacheKey == raw && headingOnlyCacheValue != null) return headingOnlyCacheValue!!
+        val v = applyHeadingOnly(raw)
+        headingOnlyCacheKey = raw
+        headingOnlyCacheValue = v
+        return v
+    }
+
+    /** 仅标题高亮（大文档编辑态的结构化降级：标题着色帮助定位，其余纯文本） */
+    private fun applyHeadingOnly(raw: String): AnnotatedString {
+        val builder = AnnotatedString.Builder(raw)
+        // 围栏代码块区间内的 # 不被当作标题（代码区保持纯文本）
+        applyHeadingHighlight(raw, builder, scanFencedBlocks(raw))
+        return builder.toAnnotatedString()
+    }
+
+    /**
+     * 全量计算语法高亮（同步路径直接调用；异步路径在后台线程调用）。
+     *
+     * 优化点：
+     * 1. **去掉全篇基础色 span**：BasicTextField 的 textStyle 已设 onSurface 默认色，
+     *    与 colors.text 基本一致，无需再覆盖全篇。去掉后省一个覆盖全篇的 span，
+     *    减少 StaticLayout 的 span 排序/二分查找开销。
+     * 2. **长文档降级高亮**：超过 [REDUCED_HIGHLIGHT_THRESHOLD] 字符时，只高亮
+     *    对可读性影响最大的核心元素（标题/加粗/斜体/删除线/代码/链接），跳过
+     *    列表标记/引用/分隔线（视觉影响小但 span 数多，实测占 23-27%）。
+     *    长文档的 span 数可从 ~960 降到 ~730，StaticLayout 渲染更流畅。
+     */
     private fun computeHighlight(raw: String): AnnotatedString {
         val builder = AnnotatedString.Builder(raw)
 
-        // 应用基础文本颜色
-        builder.addStyle(
-            SpanStyle(color = colors.text),
-            0, raw.length
-        )
+        // 围栏代码块区间：区间内屏蔽所有语法高亮（代码区保持纯文本，防 ``` ``` 内部
+        // 的 #、**、- 列表等被全局正则误染）
+        val fences = scanFencedBlocks(raw)
 
         // 按优先级应用高亮（后面的可能覆盖前面的）
-        applyHeadingHighlight(raw, builder)
-        applyBoldItalicHighlight(raw, builder)
-        applyBoldHighlight(raw, builder)
-        applyItalicHighlight(raw, builder)
-        applyStrikethroughHighlight(raw, builder)
-        applyCodeHighlight(raw, builder)
-        applyLinkHighlight(raw, builder)
-        applyListHighlight(raw, builder)
-        applyQuoteHighlight(raw, builder)
-        applyRuleHighlight(raw, builder)
+        applyHeadingHighlight(raw, builder, fences)
+        applyBoldItalicHighlight(raw, builder, fences)
+        applyBoldHighlight(raw, builder, fences)
+        applyItalicHighlight(raw, builder, fences)
+        applyStrikethroughHighlight(raw, builder, fences)
+        applyCodeHighlight(raw, builder, fences)
+        applyLinkHighlight(raw, builder, fences)
+
+        // 长文档降级：跳过列表/引用/分隔线（span 数多、视觉影响小）
+        if (raw.length <= REDUCED_HIGHLIGHT_THRESHOLD) {
+            applyListHighlight(raw, builder, fences)
+            applyQuoteHighlight(raw, builder, fences)
+            applyRuleHighlight(raw, builder, fences)
+        }
 
         return builder.toAnnotatedString()
     }
 
     // ==================== 高亮方法 ====================
 
-    private fun applyHeadingHighlight(raw: String, builder: AnnotatedString.Builder) {
+    /**
+     * 扫描围栏代码块区间（``` ``` / ~~~ ~~~），区间内屏蔽所有语法高亮。
+     *
+     * 用栈式配对处理嵌套/异长 fence：`...``` 开 ` ```` `...``` ` ` ``` ``` 由与外层相同字符
+     * 且长度 ≥ 外层长度的 fence 行闭合；不同字符或更短的 fence 行视为内容不闭合。
+     * 未闭合者（文档被截断）容忍到文末。返回已按起始位置升序、互不重叠的区间列表。
+     */
+    private fun scanFencedBlocks(text: String): List<IntRange> {
+        val ranges = mutableListOf<IntRange>()
+        var openStart = -1
+        var openChar = '`'
+        var openLen = 0
+        var lineStart = 0
+        // 逐字符定位行边界（避免 split 产生额外数组开销）
+        val n = text.length
+        while (lineStart <= n) {
+            val lf = text.indexOf('\n', lineStart)
+            val lineEnd = if (lf == -1) n else lf
+            if (lineStart == lineEnd || text[lineStart] != '\n') {
+                val line = text.substring(lineStart, lineEnd)
+                val m = FENCE_PATTERN.find(line)
+                if (m != null) {
+                    val marker = m.groupValues[1]
+                    val ch = marker[0]
+                    val len = marker.length
+                    if (openStart < 0) {
+                        openStart = lineStart
+                        openChar = ch
+                        openLen = len
+                    } else if (ch == openChar && len >= openLen) {
+                        ranges.add(openStart..(lineEnd - 1))
+                        openStart = -1
+                    }
+                }
+            }
+            if (lf == -1) break
+            lineStart = lf + 1
+        }
+        if (openStart >= 0) ranges.add(openStart..(text.length - 1))
+        return ranges
+    }
+
+    /** 判断 offset 是否落在任一围栏代码块区间内（fences 已升序且互不重叠，用二分） */
+    private fun isInFences(fences: List<IntRange>, offset: Int): Boolean {
+        if (fences.isEmpty()) return false
+        var lo = 0
+        var hi = fences.size - 1
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            val r = fences[mid]
+            when {
+                offset < r.first -> hi = mid - 1
+                offset > r.last -> lo = mid + 1
+                else -> return true
+            }
+        }
+        return false
+    }
+
+    private fun applyHeadingHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in HEADING_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与标题高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -250,9 +475,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyBoldItalicHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyBoldItalicHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in BOLD_ITALIC_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与缩体高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -265,9 +491,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyBoldHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyBoldHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in BOLD_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与缩体高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -279,9 +506,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyItalicHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyItalicHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in ITALIC_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与斜体高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -293,9 +521,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyStrikethroughHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyStrikethroughHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in STRIKETHROUGH_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与删除线高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -307,9 +536,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyCodeHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyCodeHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in CODE_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与行内代码高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -320,9 +550,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyLinkHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyLinkHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in LINK_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与链接高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -333,11 +564,11 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyListHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyListHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         // 无序列表：- * +
         for (match in LIST_UNORDERED_PATTERN.findAll(raw)) {
-            val start = match.groupValues[1].length.coerceAtMost(match.range.first)
             val markerStart = match.range.first + match.groupValues[1].length
+            if (isInFences(fences, markerStart)) continue // 围栏代码块内不参与列表高亮
             val markerEnd = match.range.last
             builder.addStyle(
                 SpanStyle(
@@ -350,6 +581,7 @@ class MarkdownSyntaxHighlighter(
         // 有序列表：1. 2) 等
         for (match in LIST_ORDERED_PATTERN.findAll(raw)) {
             val markerStart = match.range.first + match.groupValues[1].length
+            if (isInFences(fences, markerStart)) continue // 围栏代码块内不参与列表高亮
             val markerEnd = match.range.last
             builder.addStyle(
                 SpanStyle(
@@ -361,9 +593,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyQuoteHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyQuoteHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in QUOTE_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与引用高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(
@@ -375,9 +608,10 @@ class MarkdownSyntaxHighlighter(
         }
     }
 
-    private fun applyRuleHighlight(raw: String, builder: AnnotatedString.Builder) {
+    private fun applyRuleHighlight(raw: String, builder: AnnotatedString.Builder, fences: List<IntRange>) {
         for (match in RULE_PATTERN.findAll(raw)) {
             val start = match.range.first
+            if (isInFences(fences, start)) continue // 围栏代码块内不参与分隔线高亮
             val end = match.range.last + 1
             builder.addStyle(
                 SpanStyle(

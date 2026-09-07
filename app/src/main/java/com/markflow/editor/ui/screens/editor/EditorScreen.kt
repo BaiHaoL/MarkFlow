@@ -6,7 +6,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.*
@@ -33,21 +36,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.coerceIn
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -88,7 +96,10 @@ private val encodingOptions = listOf("UTF-8", "GBK", "GB18030", "UTF-16LE", "UTF
  * @param isDarkTheme 当前是否为深色主题
  * @param onNavigateBack 返回回调
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(
+    ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class
+)
 @Composable
 fun EditorScreen(
     fileUri: String,
@@ -108,9 +119,15 @@ fun EditorScreen(
         }
     }
 
-    // 编辑区焦点管理：文件打开时自动聚焦到文本开头
+    // 编辑区焦点能力载体：挂在 BasicTextField 上供需要时 requestFocus。
+    // （不再自动聚焦——文件打开呈浏览态，点击文本才进入编辑并落光标；B′ 已保证长按不跳顶，
+    //   故无需再靠"首载聚焦制造可见光标"来防跳顶。）
     val editFocusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
+    // 主编辑框焦点状态：用于「无键盘有光标时按返回键先取消光标、再按才退出文件」。
+    // BackHandler 触发时键盘必已收起（IME 可见时会先消费返回键收键盘），故无需判断 IME 状态。
+    var isEditorFocused by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
 
     // 图片选择器：选取图片后写入 .md 同级 images/ 目录并在光标处插入引用
     val imagePickerLauncher = rememberLauncherForActivityResult(
@@ -152,15 +169,14 @@ fun EditorScreen(
         when {
             uiState.isImmersiveMode -> viewModel.toggleImmersiveMode()
             uiState.pagedEditingIndex != null -> viewModel.cancelPagedEdit()
+            // 无键盘有光标：先取消光标（失焦），再按返回键才退出文件
+            isEditorFocused -> focusManager.clearFocus()
             else -> viewModel.requestNavigateBack { onNavigateBack() }
         }
     }
 
     var textFieldValue by remember { mutableStateOf(TextFieldValue(text = "")) }
     var isInternalUpdate by remember { mutableStateOf(false) }
-
-    // 标记是否已完成首次加载聚焦
-    var hasInitialFocus by remember { mutableStateOf(false) }
 
     LaunchedEffect(uiState.currentContent) {
         if (!isInternalUpdate && textFieldValue.text != uiState.currentContent) {
@@ -174,20 +190,6 @@ fun EditorScreen(
                 text = newContent,
                 selection = TextRange(cursorPos)
             )
-            // 文件首次加载完成后，将光标聚焦到文本开头，但不打开键盘
-            if (!hasInitialFocus && newContent.isNotEmpty()) {
-                hasInitialFocus = true
-                textFieldValue = TextFieldValue(
-                    text = newContent,
-                    selection = TextRange(0)
-                )
-                try {
-                    editFocusRequester.requestFocus()
-                } catch (_: IllegalStateException) {
-                    // Activity 重建（主题切换等）时 FocusRequester 可能尚未附着到 Modifier
-                }
-                keyboardController?.hide()
-            }
             // 应用后清除标记，避免后续内容更新重复使用
             if (uiState.pendingCursorPos != null) {
                 viewModel.clearPendingCursor()
@@ -195,43 +197,30 @@ fun EditorScreen(
         }
     }
 
-    // 选中文本时隐藏键盘：非折叠选区 = 用户正在选择/复制，不需要 IME 输入
+    // 选中文本时的键盘策略：原则是"框选不改变键盘升降状态"。
+    // - 键盘未升起(浏览态)时产生选区：仍照旧 hide(无害，且能压制长按偶发带起的 IME)，保持不弹。
+    // - 键盘已升起(输入中)时产生选区：不再 hide → 键盘保持升起，不因框选而收起(用户场景 B)。
+    // isImeVisible 经 rememberUpdatedState 供 LaunchedEffect 读取；不触碰 B′(pointerInput 就近落点)。
+    val imeVisibleNow by rememberUpdatedState(WindowInsets.isImeVisible)
     LaunchedEffect(textFieldValue.selection.collapsed) {
-        if (!textFieldValue.selection.collapsed) {
+        if (!textFieldValue.selection.collapsed && !imeVisibleNow) {
             keyboardController?.hide()
         }
     }
 
-    // 滚动同步：编辑区和预览区
+    // 编辑区 / 预览区各自的滚动位置（EDIT 与 PREVIEW 二选一，互不同屏、互不联动同步）
     val editScrollState = rememberScrollState()
     val previewScrollState = rememberScrollState()
 
-    // 持续追踪编辑区有效滚动位置，跨 EDIT↔PREVIEW 模式切换存活。
-    // EditContentView 销毁重建时 lastGoodScroll 从 scrollState.value 初始化
-    // 可能读到 0（垂直滚动刚重新附着），导致补偿机制失效、选中文本跳顶。
-    // 此处在 EditorScreen 层 snapshotFlow 持续捕获，但使用非 State 容器存储，
-    // 避免滚动时每帧更新触发 EditorScreen → EditContentView 重组，导致
-    // BasicTextField + VisualTransformation 对长文本重新布局，造成卡顿。
-    val confirmedScrollPosRef = remember { com.markflow.editor.util.Ref(0) }
-    LaunchedEffect(editScrollState) {
-        snapshotFlow { editScrollState.value }
-            .collect { v -> if (v > 0) confirmedScrollPosRef.value = v }
-    }
+    // 编辑区滚动位置由 editScrollState（EditorScreen 级 remember）跨 EDIT↔PREVIEW
+    // 模式切换保留：EditContentView 销毁重建时 verticalScroll 重新附着同一 state，
+    // value 不重置，无需额外快照。
 
-    // 仅在切换到编辑模式时从 confirmedScrollPosRef 快照取值，
-    // 作为 EditContentView 的 initialGoodScroll 参数，避免滚动时每帧重组。
-    var initialGoodScroll by remember { mutableIntStateOf(0) }
-    LaunchedEffect(uiState.editorMode) {
-        if (uiState.editorMode == EditorMode.EDIT) {
-            initialGoodScroll = confirmedScrollPosRef.value
-        }
-    }
-
-    // 编辑区 TextLayoutResult，用于光标跟随、搜索跳转、分屏行号同步
+    // 编辑区 TextLayoutResult，用于光标跟随、搜索跳转定位
     var editLayoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
 
     // 搜索上下文点击跳转触发器（递增触发 LaunchedEffect）
-    var searchJumpTrigger by remember { mutableStateOf(0) }
+    var searchJumpTrigger by remember { mutableIntStateOf(0) }
 
     // 编码切换菜单（仅 txt 文件显示）
     var showEncodingMenu by remember { mutableStateOf(false) }
@@ -470,26 +459,30 @@ fun EditorScreen(
                                     textFieldValue = textFieldValue,
                                     onValueChange = { v ->
                                         isInternalUpdate = true
-                                        val formatted = AutoTextFormatter.applyListFormatting(
-                                            previousTextFieldValue.value, v
-                                        )
+                                        val formatted = if (uiState.isMarkdown) {
+                                            AutoTextFormatter.applyListFormatting(
+                                                previousTextFieldValue.value, v
+                                            )
+                                        } else {
+                                            v
+                                        }
                                         previousTextFieldValue.value = formatted
                                         textFieldValue = formatted
                                         viewModel.updateContent(formatted.text, formatted.selection.start)
                                         isInternalUpdate = false
                                     },
                                     scrollState = editScrollState,
-                                    initialGoodScroll = initialGoodScroll,
                                     // 大 md：编辑保留全文但禁用语法高亮（防 2.38MB 级文档高亮开销）
                                     isMarkdown = uiState.isMarkdown && !uiState.isLargeMd,
-                                    // 占位仅对 Markdown 空白文件显示（非 .md 空白文件不显示语法参考）
-                                    showMarkdownPlaceholder = uiState.isMarkdown,
+                                    // 占位按文件类型选择；空白文件才显示（大文件走分页只读，不经过本视图故天然不显示）
+                                    placeholderText = PlaceholderTemplates.forExtension(uiState.fileExtension),
                                     isDarkTheme = isDarkTheme,
                                     searchQuery = uiState.searchQuery,
                                     searchMatches = uiState.searchMatchPositions,
                                     currentSearchIndex = uiState.currentSearchIndex,
                                     onLayoutResult = { editLayoutResult = it },
-                                    focusRequester = editFocusRequester
+                                    focusRequester = editFocusRequester,
+                                    onFocusChanged = { isEditorFocused = it }
                                 )
                             }
                         }
@@ -882,10 +875,11 @@ private fun PlainTxtPreview(content: String) {
     }
 }
 
-// ==================== 滚动同步辅助 ====================
+// ==================== 搜索跳转定位辅助 ====================
 
 /**
  * 根据 TextLayoutResult 将指定字符偏移所在行居中滚动。
+ * 供编辑模式搜索跳转 / 搜索上下文点击定位使用。
  * 使用行中心（(lineTop + lineBottom) / 2）而非行顶部做居中计算，
  * 确保关键词视觉上位于屏幕垂直中央。
  *
@@ -945,7 +939,7 @@ private fun EditorModeSwitchBar(
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         if (hasPreviewMode) {
-            // 编辑/预览切换：同一位置单图标，编辑显示笔、预览显示眼睛，点击互相切换
+            // 编辑/预览切换：同一位置单图标，编辑显示眼睛、预览显示笔，点击互相切换
             IconButton(
                 onClick = {
                     if (currentMode == EditorMode.EDIT) onSwitchToPreview() else onSwitchToEdit()
@@ -954,9 +948,9 @@ private fun EditorModeSwitchBar(
             ) {
                 Icon(
                     imageVector = if (currentMode == EditorMode.EDIT) {
-                        Icons.Default.Create
-                    } else {
                         Icons.Default.Visibility
+                    } else {
+                        Icons.Default.Create
                     },
                     contentDescription = if (currentMode == EditorMode.EDIT) "切换到预览" else "切换到编辑",
                     tint = MaterialTheme.colorScheme.primary
@@ -1045,28 +1039,29 @@ private class SearchHighlightTransformation(
  * 特性：
  * - 搜索关键词高亮（VisualTransformation，不影响实际文本和光标）
  * - 光标跟随：键盘弹出或光标移动时自动滚动保持光标可见
- * - 暴露 TextLayoutResult 供外部（分屏同步、搜索跳转）使用
+ * - 暴露 TextLayoutResult 供外部（光标跟随、搜索跳转定位）使用
  *
  * @param searchQuery 搜索关键词
  * @param searchMatches 搜索匹配项的字符偏移列表
  * @param currentSearchIndex 当前高亮的匹配项索引
  * @param onLayoutResult TextLayoutResult 回调
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun EditContentView(
     textFieldValue: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
-    initialGoodScroll: Int = 0,
     isMarkdown: Boolean = false,
-    /** 是否显示 Markdown 语法参考占位（仅 Markdown 空白文件显示，与语法高亮开关解耦） */
-    showMarkdownPlaceholder: Boolean = false,
+    /** 空白文件占位文本；null = 不显示占位（按文件类型由调用方传入） */
+    placeholderText: String? = null,
     isDarkTheme: Boolean = false,
     searchQuery: String = "",
     searchMatches: List<Int> = emptyList(),
     currentSearchIndex: Int = -1,
     onLayoutResult: (TextLayoutResult) -> Unit = {},
-    focusRequester: FocusRequester = remember { FocusRequester() }
+    focusRequester: FocusRequester = remember { FocusRequester() },
+    onFocusChanged: (Boolean) -> Unit = {}
 ) {
     // 语法高亮：仅在 Markdown 文件且非搜索状态时启用
     val markdownHighlighter = remember(isDarkTheme) {
@@ -1080,67 +1075,55 @@ private fun EditContentView(
         onDispose { markdownHighlighter.cancelPending() }
     }
 
+    // 异步高亮版本号：后台高亮计算完成后自增，此处用 by 委托读取 Int 值建立组合层依赖。
+    //
+    // 必须用 by 委托（或 .value）读取——若用 = 赋值，highlightVersion 变量拿到的是
+    // State<Int> 对象引用而非值。State 对象引用永远不变，放进 remember key 后 key 恒定，
+    // 永不触发重组 → 异步高亮完成后 filter 不会重跑 → 高亮永远不上屏（"长按后才有高亮"
+    // 根因：长按改变 selection 触发 BasicTextField 重组碰巧重跑 filter，但正常打开
+    // 不会）。by 委托在 Composable 层建立 State 订阅，cacheVersion 变化即触发重组。
+    val highlightVersion by markdownHighlighter.highlightVersion
+
     // 搜索高亮 / 语法高亮：搜索优先
-    val visualTransformation = remember(searchQuery, searchMatches, currentSearchIndex, isMarkdown) {
+    //
+    // highlightVersion 纳入 remember key：异步高亮完成后版本号自增 → by 委托读到新值 →
+    // 此处重组 → 创建一个新的 VisualTransformation 包装实例 → BasicTextField 检测到 VT 实例
+    // 变化后重新调用 filter → 此时缓存已就绪 → 命中 → 高亮正确上屏。
+    //
+    // 不能直接返回 markdownHighlighter：BasicTextField 对同一 VT 实例引用会跳过
+    // filter 重跑，必须每次 highlightVersion 变化时创建新包装实例强制重跑。
+    val visualTransformation = remember(
+        searchQuery, searchMatches, currentSearchIndex, isMarkdown, highlightVersion
+    ) {
         when {
             searchQuery.isNotEmpty() && searchMatches.isNotEmpty() ->
                 SearchHighlightTransformation(searchMatches, currentSearchIndex, searchQuery.length)
-            isMarkdown -> markdownHighlighter
+            isMarkdown -> {
+                val inner = markdownHighlighter
+                object : VisualTransformation {
+                    override fun filter(text: AnnotatedString): TransformedText = inner.filter(text)
+                }
+            }
             else -> VisualTransformation.None
-        }
-    }
-
-    // 缓存占位文本，避免每次重组都重新构建字符串
-    val placeholderText = remember {
-        buildString {
-            appendLine("开始编写 Markdown 文档…")
-            appendLine()
-            appendLine("语法参考：")
-            appendLine("# 一级标题")
-            appendLine("## 二级标题")
-            appendLine("**加粗文字**")
-            appendLine("*斜体文字*")
-            appendLine("- 无序列表项")
-            appendLine("1. 有序列表项")
-            appendLine("> 引用文本")
-            appendLine("```")
-            appendLine("代码块")
-            appendLine("```")
-            appendLine("[链接文字](https://example.com)")
-            appendLine("![图片描述](images/xxx.png)")
         }
     }
 
     // 缓存 layout 结果，始终更新以保持搜索跳转的准确性
     var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
 
-    // BasicTextField 首次触发的 bringIntoView 可能因 graphicsLayer 未稳定
-    // 将外层 scrollState 异常归零；snapshotFlow 持续追踪有效滚动位置。
-    // 初始值从外部 confirmedScrollPos 传入，跨模式切换存活。
-    // 仅在选区折叠时更新，选区激活期间冻结，防止 bringIntoView 造成的
-    // 异常滚动值污染 lastGoodScroll。
-    var lastGoodScroll by remember { mutableIntStateOf(initialGoodScroll) }
-
-    LaunchedEffect(Unit) {
-        snapshotFlow { scrollState.value to textFieldValue.selection.collapsed }
-            .collect { (v, collapsed) -> if (v > 0 && collapsed) lastGoodScroll = v }
-    }
-
-    // 复制框激活时 bringIntoView 可能改变 scrollState.value（不限于归零），
-    // 将偏离量通过 graphicsLayer 在同帧补偿，消除位移；随后异步恢复实际值。
-    val compensationOffset by remember {
-        derivedStateOf {
-            if (!textFieldValue.selection.collapsed && lastGoodScroll > 0) {
-                val delta = scrollState.value - lastGoodScroll
-                if (delta != 0) -delta.toFloat() else 0f
-            } else 0f
-        }
-    }
-
     // 搜索激活及关闭后锁定光标跟随：只要用户没有再次输入/移动光标，
     // 关闭搜索栏引发的视图/滚动变化都不会把文本拉回光标处，保证"保持当前页面不动"。
     var wasSearchActive by remember { mutableStateOf(false) }
     var suppressCursorFollowUntilEdit by remember { mutableStateOf(false) }
+    // 【X-H6 B′ 修复(2026-09-05 根因)】pointerInput(Unit) 的 suspend 块只随 key=Unit 变化重启、
+    // 不随重组更新，闭包会捕获【首次组合时】的 textFieldValue(空文本)而永远读到陈旧值，导致
+    // B′ 落点因 text.isEmpty() 恒真而永不执行。用 rememberUpdatedState 使 B′ 始终读到最新值。
+    val currentTextFieldValue by rememberUpdatedState(textFieldValue)
+    // 滚动容器可视高度(px)：空文件文本仅一行时，用它给 BasicTextField 设 minHeight 铺满
+    // 整屏，使点击首行以下的空白也能落在文本控件上而聚焦；不能用 fillMaxHeight——
+    // 外层 verticalScroll 给子节点的高度约束是无限大，会被拉成无穷高而运行时崩溃。
+    val density = LocalDensity.current
+    var editAreaHeightPx by remember { mutableIntStateOf(0) }
     val editTextFieldValueChange: (TextFieldValue) -> Unit = { nv ->
         if (suppressCursorFollowUntilEdit) suppressCursorFollowUntilEdit = false
         onValueChange(nv)
@@ -1152,20 +1135,67 @@ private fun EditContentView(
             .background(MaterialTheme.colorScheme.surface)
             .padding(16.dp)
     ) {
-        // 外层 Box 负责滚动，避免 BasicTextField 内部 bringIntoView 误跳到顶部
-        // graphicsLayer 补偿：bringIntoView 异常归零时，视觉层同步补偿偏移，消除闪烁
+        // 【X-H6】长按框选"跳顶"根治见 BasicTextField 的 pointerInput（B′：长按前把折叠
+        // 光标落到 down 点，消除视口外幽灵 offset 0）。此处不再需要主动拉回等兜底。
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .onSizeChanged { editAreaHeightPx = it.height }
                 .verticalScroll(scrollState)
-                .graphicsLayer { translationY = compensationOffset }
         ) {
             BasicTextField(
                 value = textFieldValue,
                 onValueChange = editTextFieldValueChange,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .focusRequester(focusRequester),
+                    // 最小高度铺满可视区：空文件文本仅一行时让点击空白也能聚焦（见上 editAreaHeightPx）
+                    .heightIn(min = with(density) { editAreaHeightPx.toDp() })
+                    .focusRequester(focusRequester)
+                    .onFocusChanged { onFocusChanged(it.isFocused) }
+                    // 【X-H6 B′ 根治·长按前锚定落点】(2026-09-05 真机定案)
+                    //
+                    // 背景：BasicTextField 旧 API 在"折叠逻辑光标停在不随视口的幽灵 offset 0"时
+                    // 直接长按框选，内部 reveal 会用该幽灵位置把视口滚回文章顶部(跳顶，Compose 官方
+                    // 已知缺陷 #235693496 / CMP #4014)。用户实证"先点一下让光标落中段再长按就不跳"，
+                    // 本逻辑即自动化的"先点一下"。
+                    //
+                    // 真正根因(非幽灵值本身)：pointerInput(Unit) 的 suspend 块只随 key=Unit 变化重启、
+                    // 不随重组更新，直接捕获 textFieldValue 参数会拿到【首次组合】时的陈旧空文本，
+                    // 使下方 text.isEmpty() 恒真、落点永不执行 → 长按仍走幽灵 offset0 → 跳顶。
+                    // 用 rememberUpdatedState 的 currentTextFieldValue 读最新值后根治(见下方 pointerInput)。
+                    //
+                    // 做法：任何 down 落在文本区时，若当前是【折叠光标】且未停在该 down 的字符处，
+                    // 先把逻辑光标设到 down 的字符 offset(就近)。TextField 随后长按 reveal 便基于
+                    // 就近位置，不再从 offset 0 远跳顶。
+                    //
+                    // 关键保证：
+                    //  1) awaitFirstDown(requireUnconsumed=false)【只观察不消费】，不破坏 TextField
+                    //     自身的 tap/双击/长按/拖选手势；
+                    //  2) 仅折叠态(collapsed)才干预，避免打断正在进行的框选拖动(非折叠)。
+                    //  3) setSelection 触发的"光标跟随"会检查新光标(即 down 点，必在视口内，
+                    //     因用户看得见才长按)→ 不触发 scrollTo，无副作用。
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val layout = layoutResult
+                            // 用 rememberUpdatedState 的 currentTextFieldValue 而非裸 textFieldValue：
+                            // pointerInput 块不随重组重启，闭包读裸参数会拿到首次组合的陈旧空文本，
+                            // 导致落点永不执行(跳顶根因)。currentTextFieldValue 始终是当前最新值。
+                            val text = currentTextFieldValue.text
+                            val sel = currentTextFieldValue.selection
+                            if (layout != null && text.isNotEmpty() && sel.collapsed) {
+                                val off = layout.getOffsetForPosition(down.position)
+                                    .coerceIn(0, text.length)
+                                if (off != sel.start) {
+                                    editTextFieldValueChange(
+                                        currentTextFieldValue.copy(selection = TextRange(off))
+                                    )
+                                }
+                            }
+                            // 等待手势结束再处理下一个 down，避免 up 状态残留
+                            waitForUpOrCancellation()
+                        }
+                    },
                 textStyle = MaterialTheme.typography.bodyMedium.copy(
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurface
@@ -1178,9 +1208,9 @@ private fun EditContentView(
                 },
                 decorationBox = { innerTextField ->
                     Box {
-                        if (textFieldValue.text.isEmpty() && showMarkdownPlaceholder) {
+                        if (textFieldValue.text.isEmpty() && placeholderText != null) {
                             Text(
-                                text = placeholderText,
+                                text = placeholderText.orEmpty(),
                                 style = MaterialTheme.typography.bodyMedium.copy(
                                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                                 ),
@@ -1229,14 +1259,6 @@ private fun EditContentView(
                         .coerceIn(0f, scrollState.maxValue.toFloat())
                     scrollState.scrollTo(target.toInt())
                 }
-            }
-        }
-
-        // graphicsLayer 补偿生效后，异步将 scrollState 恢复到真实位置，
-        // 使后续交互（光标跟随、搜索跳转等）使用正确的 scrollState.value
-        LaunchedEffect(compensationOffset) {
-            if (compensationOffset != 0f) {
-                scrollState.scrollTo(lastGoodScroll.coerceAtMost(scrollState.maxValue))
             }
         }
     }

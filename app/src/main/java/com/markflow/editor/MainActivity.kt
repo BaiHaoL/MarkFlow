@@ -3,6 +3,7 @@ package com.markflow.editor
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,6 +13,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.rememberNavController
 import com.markflow.editor.data.local.PreferencesManager
+import com.markflow.editor.domain.model.FileType
 import com.markflow.editor.domain.model.ThemeMode
 import com.markflow.editor.ui.navigation.MarkFlowNavGraph
 import com.markflow.editor.ui.theme.MarkFlowTheme
@@ -109,13 +111,15 @@ class MainActivity : ComponentActivity() {
         return when (intent.action) {
             Intent.ACTION_VIEW, Intent.ACTION_EDIT -> {
                 // 文件管理器打开文件：data 就是文件 URI
-                intent.data?.let { uri ->
+                val uri = intent.data
+                // 源头校验：未注册扩展名 / 无扩展名的文件禁止打开（从源头阻止）
+                if (uri != null && isUnsupportedFile(uri)) {
+                    showUnsupportedFileToast(uri)
+                    return null
+                }
+                uri?.let {
                     // 如果是 content:// 协议，复制到应用内部存储
-                    if (uri.scheme == "content") {
-                        copyContentUriToLocal(uri)
-                    } else {
-                        uri.toString()
-                    }
+                    if (it.scheme == "content") copyContentUriToLocal(it) else it.toString()
                 }
             }
             Intent.ACTION_SEND -> {
@@ -123,6 +127,10 @@ class MainActivity : ComponentActivity() {
                 // 回退到纯文本分享（EXTRA_TEXT 携带文本内容）
                 val streamUri = getStreamUriFromIntent(intent)
                 if (streamUri != null) {
+                    if (isUnsupportedFile(streamUri)) {
+                        showUnsupportedFileToast(streamUri)
+                        return null
+                    }
                     copyContentUriToLocal(streamUri)
                 } else {
                     handleSharedText(intent)
@@ -130,6 +138,30 @@ class MainActivity : ComponentActivity() {
             }
             else -> null
         }
+    }
+
+    /**
+     * 判断文件 URI 是否"不支持打开"（未注册扩展名或无扩展名），应拒绝。
+     *
+     * 无法获取文件名（某些 content provider 不返回 DISPLAY_NAME 且路径不含扩展名）时
+     * 返回 false 放行——交给编辑器兜底（copyContentUriToLocal 会补默认 .md 名，
+     * 且大文件仍受 loadFile 的分页保护）。
+     */
+    private fun isUnsupportedFile(uri: android.net.Uri): Boolean {
+        val name = resolveFileName(uri) ?: return false
+        return !FileType.isSupported(name)
+    }
+
+    /** 从 URI 解析文件名：DISPLAY_NAME 优先，路径猜测兜底，最后取 lastPathSegment */
+    private fun resolveFileName(uri: android.net.Uri): String? {
+        getFileNameFromUri(uri)?.let { return it }
+        guessFileNameFromUri(uri)?.let { return it }
+        return uri.lastPathSegment?.takeIf { it.contains('.') }
+    }
+
+    private fun showUnsupportedFileToast(uri: android.net.Uri) {
+        val name = resolveFileName(uri) ?: "该文件"
+        Toast.makeText(this, "不支持的文件类型：$name", Toast.LENGTH_SHORT).show()
     }
 
     /**

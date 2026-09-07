@@ -7,6 +7,7 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.annotation.SuppressLint
 import android.app.RecoverableSecurityException
 import android.os.Build
 import android.os.Environment
@@ -30,7 +31,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import java.util.Collections
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -38,7 +38,6 @@ import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
@@ -708,6 +707,7 @@ class StorageRepository @Inject constructor(
      * @param uris 要删除的文件 URI 列表
      * @return 成功删除的文件 URI 集合
      */
+    @SuppressLint("NewApi") // RecoverableSecurityException(API29+) 仅 Android 11+ MediaStore 会抛出；旧系统不抛故 catch 安全，见方法内注释
     suspend fun deleteFiles(uris: List<String>): Set<String> = withContext(Dispatchers.IO) {
         val batchSize = 16
         val succeeded = Collections.synchronizedSet(mutableSetOf<String>())
@@ -834,6 +834,7 @@ class StorageRepository @Inject constructor(
     /**
      * 处理 content:// URI 的重命名
      */
+    @SuppressLint("NewApi") // 同 deleteFiles：RecoverableSecurityException 仅 API29+ 抛出，旧系统不命中此 catch
     private fun renameFileViaContentProvider(uri: Uri, fullNewName: String): Result<Unit> {
         // 路径 2a：MediaStore API（适用于 content://media/... URI）
         try {
@@ -1026,12 +1027,13 @@ class StorageRepository @Inject constructor(
             val fileName = getFileName(sourceUri.toString())
                 ?: "imported_${System.currentTimeMillis()}.txt"
 
-            // 验证文件类型是否受支持
-            val fileType = FileType.resolve(fileName)
-                ?: return@withContext null
+            // 验证文件类型是否受支持（不支持则导入失败）
+            if (FileType.resolve(fileName) == null) return@withContext null
 
-            // 根据文件类型确定 MIME 类型
-            val mimeType = if (fileType.isMarkdown) "text/markdown" else "text/plain"
+            // 根据扩展名推断 MIME，必须与 DISPLAY_NAME 的扩展名匹配——
+            // 若硬编码 text/plain，Android 11+ MediaStore 会因 MIME 与扩展名不匹配
+            // 自动追加规范后缀（如 Main.java → Main.java.txt，同重命名的 X-H5 教训）
+            val mimeType = inferMimeType(fileName)
 
             val contentValues = ContentValues().apply {
                 put(MediaStore.Files.FileColumns.DISPLAY_NAME, fileName)
@@ -1075,6 +1077,10 @@ class StorageRepository @Inject constructor(
 
     /**
      * 从 URI 获取文件名
+     *
+     * file:// URI 由 File.toURI() 生成（编码态：# → %23、空格 → %20、中文 → %XX），
+     * query 不支持 file scheme 会走 fallback，此时必须 Uri.decode 还原磁盘真实文件名，
+     * 否则返回 %23%20 之类的编码串导致标题乱码、后缀判定错误。
      */
     fun getFileName(uriString: String): String? {
         try {
@@ -1089,6 +1095,7 @@ class StorageRepository @Inject constructor(
         } catch (_: Exception) {
             // 忽略
         }
-        return uriString.substringAfterLast("/")
+        val lastSegment = uriString.substringAfterLast("/")
+        return if (uriString.startsWith("file:")) Uri.decode(lastSegment) else lastSegment
     }
 }
