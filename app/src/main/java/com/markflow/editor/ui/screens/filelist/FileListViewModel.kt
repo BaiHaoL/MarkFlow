@@ -6,28 +6,29 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.markflow.editor.data.local.PreferencesManager
 import com.markflow.editor.data.repository.FileRepository
-import com.markflow.editor.domain.model.FileSource
 import com.markflow.editor.domain.model.MarkdownFile
 import com.markflow.editor.domain.model.PendingFileOperation
 import com.markflow.editor.domain.model.SecurityConsentRequiredException
 import com.markflow.editor.domain.model.SortMode
 import com.markflow.editor.domain.util.FileSorter
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
  * 文件列表页 UI 状态
  */
 data class FileListUiState(
-    /** Markdown 文件列表（应用内创建或设备存储中的 .md 文件） */
-    val localFiles: List<MarkdownFile> = emptyList(),
-    /** 非 Markdown 文本文件列表（如 .py, .sh, .json 等） */
+    /** 最近打开文件（≤ RECENT_QUEUE_SIZE，按最近打开顺序、队首最新，不受 sortMode 影响） */
+    val recentFiles: List<MarkdownFile> = emptyList(),
+    /** Markdown 文件列表（排除最近打开；MediaStore 扫描 + 私有导入中的 .md） */
+    val mdFiles: List<MarkdownFile> = emptyList(),
+    /** 非 Markdown 文本文件列表（排除最近打开） */
     val otherFiles: List<MarkdownFile> = emptyList(),
-    /** 导入文件列表（跨应用打开的文件） */
-    val importedFiles: List<MarkdownFile> = emptyList(),
     /** 合并后的文件列表（用于多选、搜索等操作） */
     val files: List<MarkdownFile> = emptyList(),
     val isLoading: Boolean = false,
@@ -100,6 +101,12 @@ class FileListViewModel @Inject constructor(
                 silentRefresh()
             }
         }
+        // 监听文件打开事件，重排「最近打开」队列并刷新分区
+        viewModelScope.launch {
+            fileRepository.fileOpenedEvent.collect {
+                silentRefresh()
+            }
+        }
     }
 
     // ==================== 文件加载 ====================
@@ -116,7 +123,6 @@ class FileListViewModel @Inject constructor(
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
             val sortMode = _uiState.value.sortMode
-            val sortedImported = FileSorter.sort(fileRepository.getImportedFiles(), sortMode)
             fileRepository.getFiles(sortMode)
                 .catch { e ->
                     _uiState.update {
@@ -127,19 +133,12 @@ class FileListViewModel @Inject constructor(
                     }
                 }
                 .collect { allFiles ->
-                    val mdFiles = allFiles.filter { it.isMarkdown }
-                    val nonMdFiles = allFiles.filter { !it.isMarkdown }
-                    _uiState.update {
-                        it.copy(
-                            sortMode = sortMode,
-                            localFiles = mdFiles,
-                            otherFiles = nonMdFiles,
-                            importedFiles = sortedImported,
-                            files = sortedImported + mdFiles + nonMdFiles,
-                            isLoading = false,
-                            errorMessage = null
-                        )
+                    // 私有目录扫描（filesDir）同步 I/O 放 IO 线程，避免阻塞主线程
+                    val imported = withContext(Dispatchers.IO) {
+                        fileRepository.getImportedFiles()
                     }
+                    val pool = mergeByUri(allFiles + imported)
+                    partitionAndSet(sortMode, pool, updateLoading = false)
                 }
         }
     }
@@ -150,8 +149,6 @@ class FileListViewModel @Inject constructor(
         loadJob = viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val sortMode = _uiState.value.sortMode
-            // 导入文件本地扫描，需按当前 sortMode 排序
-            val sortedImported = FileSorter.sort(fileRepository.getImportedFiles(), sortMode)
             fileRepository.getFiles(sortMode)
                 .catch { e ->
                     _uiState.update {
@@ -162,20 +159,53 @@ class FileListViewModel @Inject constructor(
                     }
                 }
                 .collect { allFiles ->
-                    val mdFiles = allFiles.filter { it.isMarkdown }
-                    val nonMdFiles = allFiles.filter { !it.isMarkdown }
-                    _uiState.update {
-                        it.copy(
-                            sortMode = sortMode,
-                            localFiles = mdFiles,
-                            otherFiles = nonMdFiles,
-                            importedFiles = sortedImported,
-                            files = sortedImported + mdFiles + nonMdFiles,
-                            isLoading = false,
-                            errorMessage = null
-                        )
+                    // 私有目录扫描（filesDir）同步 I/O 放 IO 线程，避免阻塞主线程
+                    val imported = withContext(Dispatchers.IO) {
+                        fileRepository.getImportedFiles()
                     }
+                    val pool = mergeByUri(allFiles + imported)
+                    partitionAndSet(sortMode, pool, updateLoading = true)
                 }
+        }
+    }
+
+    /** 按 uri 去重合并（池 = MediaStore 扫描 + 私有导入） */
+    private fun mergeByUri(list: List<MarkdownFile>): List<MarkdownFile> {
+        val seen = mutableSetOf<String>()
+        return list.filter { seen.add(it.uri) }
+    }
+
+    /**
+     * 将合并池分区为 最近打开 / Markdown / 其他 三个互斥列表。
+     * - 最近打开：按 recentUris 队列顺序解析池中仍存在且未隐藏的文件，不受 sortMode 影响；
+     * - Markdown / 其他：去掉最近打开中的条目后，按 sortMode 排序按 isMarkdown 拆分。
+     */
+    private fun partitionAndSet(sortMode: SortMode, pool: List<MarkdownFile>, updateLoading: Boolean) {
+        val recentUris = preferencesManager.getRecentUris()
+        val recentUriSet = recentUris.toSet()
+        val map = pool.associateBy { it.uri }
+
+        val recentFiles = recentUris.mapNotNull { map[it] }
+        // 剪掉已不存在的 recent 条目（删除/隐藏后残留），保持队列干净
+        val resolvedUris = recentFiles.map { it.uri }.toSet()
+        if (resolvedUris.size != recentUris.size) {
+            preferencesManager.removeRecentUris(recentUris.filter { it !in resolvedUris })
+        }
+
+        val rest = pool.filter { it.uri !in recentUriSet }
+        val md = FileSorter.sort(rest.filter { it.isMarkdown }, sortMode)
+        val other = FileSorter.sort(rest.filter { !it.isMarkdown }, sortMode)
+
+        _uiState.update {
+            it.copy(
+                sortMode = sortMode,
+                recentFiles = recentFiles,
+                mdFiles = md,
+                otherFiles = other,
+                files = recentFiles + md + other,
+                isLoading = if (updateLoading) false else it.isLoading,
+                errorMessage = null
+            )
         }
     }
 
@@ -185,17 +215,15 @@ class FileListViewModel @Inject constructor(
         // 如果与当前排序模式相同，无需操作
         if (_uiState.value.sortMode == mode) return
         preferencesManager.setSortMode(mode)
-        // 对内存中的两个分区重新排序，排序切换不需要重新扫描文件系统
+        // 最近打开保持 recency 顺序，不受排序影响；仅重排 Markdown/其他 两区
         _uiState.update {
-            val sortedImported = FileSorter.sort(it.importedFiles, mode)
-            val sortedLocal = FileSorter.sort(it.localFiles, mode)
+            val sortedMd = FileSorter.sort(it.mdFiles, mode)
             val sortedOther = FileSorter.sort(it.otherFiles, mode)
             it.copy(
                 sortMode = mode,
-                importedFiles = sortedImported,
-                localFiles = sortedLocal,
+                mdFiles = sortedMd,
                 otherFiles = sortedOther,
-                files = sortedImported + sortedLocal + sortedOther
+                files = it.recentFiles + sortedMd + sortedOther
             )
         }
     }
@@ -276,10 +304,12 @@ class FileListViewModel @Inject constructor(
                 // 否则已删文件仍显示在列表中（UI 与磁盘状态不一致）
                 if (e.partialSucceeded.isNotEmpty()) {
                     fileRepository.unhideFiles(e.partialSucceeded.toList())
+                    // 已删除文件同步移出「最近打开」队列
+                    preferencesManager.removeRecentUris(e.partialSucceeded)
                     _uiState.update { current ->
                         current.copy(
-                            importedFiles = current.importedFiles.filterNot { it.uri in e.partialSucceeded },
-                            localFiles = current.localFiles.filterNot { it.uri in e.partialSucceeded },
+                            recentFiles = current.recentFiles.filterNot { it.uri in e.partialSucceeded },
+                            mdFiles = current.mdFiles.filterNot { it.uri in e.partialSucceeded },
                             otherFiles = current.otherFiles.filterNot { it.uri in e.partialSucceeded },
                             files = current.files.filterNot { it.uri in e.partialSucceeded },
                             selectedFiles = current.selectedFiles - e.partialSucceeded
@@ -296,14 +326,19 @@ class FileListViewModel @Inject constructor(
                 return@launch
             }
 
+            // 删除/隐藏成功 → 同步移出「最近打开」队列，保证分区互斥
+            if (removedUris.isNotEmpty()) {
+                preferencesManager.removeRecentUris(removedUris)
+            }
+
             _uiState.update { current ->
                 // 授权重试路径（urisOverride != null）仅移除本次删除项，保留其余选中状态；
                 // 正常路径（用户主动删除当前选中集）退出多选
                 val remainingSelected = current.selectedFiles - removedUris
                 val isRetry = urisOverride != null
                 current.copy(
-                    importedFiles = current.importedFiles.filterNot { it.uri in removedUris },
-                    localFiles = current.localFiles.filterNot { it.uri in removedUris },
+                    recentFiles = current.recentFiles.filterNot { it.uri in removedUris },
+                    mdFiles = current.mdFiles.filterNot { it.uri in removedUris },
                     otherFiles = current.otherFiles.filterNot { it.uri in removedUris },
                     files = current.files.filterNot { it.uri in removedUris },
                     isSelectionMode = isRetry && remainingSelected.isNotEmpty(),

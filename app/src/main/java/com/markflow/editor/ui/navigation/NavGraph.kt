@@ -27,6 +27,7 @@ import com.markflow.editor.ui.screens.filelist.FileListScreen
  * @param onEditorUriConsumed URI 消费回调：导航到编辑器后立即调用，将 URI 置 null
  * @param themeMode 当前主题模式
  * @param onThemeToggle 主题切换回调（点击 MarkFlow 标题时触发）
+ * @param onFileOpened 文件打开记录回调（所有进入编辑器的路径统一在此上报「最近打开」）
  */
 @Composable
 fun MarkFlowNavGraph(
@@ -34,7 +35,8 @@ fun MarkFlowNavGraph(
     initialEditorUri: String? = null,
     onEditorUriConsumed: () -> Unit = {},
     themeMode: ThemeMode = ThemeMode.LIGHT,
-    onThemeToggle: () -> Unit = {}
+    onThemeToggle: () -> Unit = {},
+    onFileOpened: (String) -> Unit = {}
 ) {
     // 使用 remember 确保 isDarkTheme 仅在实际依赖值变化时才重新计算
     val isDarkTheme = remember(themeMode) {
@@ -58,12 +60,14 @@ fun MarkFlowNavGraph(
                     // 编辑器经 previousBackStackEntry 原样读取
                     navController.currentBackStackEntry?.savedStateHandle
                         ?.set(Screen.EDITOR_FILE_URI_KEY, initialEditorUri)
+                    onFileOpened(initialEditorUri)
                     onEditorUriConsumed()
                     navController.navigate(Screen.Editor.route)
                 }
             }
             FileListScreen(
                 onNavigateToEditor = { fileUri ->
+                    onFileOpened(fileUri)
                     navController.currentBackStackEntry?.savedStateHandle
                         ?.set(Screen.EDITOR_FILE_URI_KEY, fileUri)
                     navController.navigate(Screen.Editor.route)

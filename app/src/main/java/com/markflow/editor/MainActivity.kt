@@ -13,6 +13,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.rememberNavController
 import com.markflow.editor.data.local.PreferencesManager
+import com.markflow.editor.data.repository.FileRepository
 import com.markflow.editor.domain.model.FileType
 import com.markflow.editor.domain.model.ThemeMode
 import com.markflow.editor.ui.navigation.MarkFlowNavGraph
@@ -34,6 +35,9 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var preferencesManager: PreferencesManager
+
+    @Inject
+    lateinit var fileRepository: FileRepository
 
     companion object {
         private const val TAG = "MainActivity"
@@ -91,7 +95,8 @@ class MainActivity : ComponentActivity() {
                             val newMode = if (themeMode == ThemeMode.LIGHT) ThemeMode.DARK else ThemeMode.LIGHT
                             preferencesManager.setThemeMode(newMode)
                             themeMode = newMode
-                        }
+                        },
+                        onFileOpened = { uri -> fileRepository.notifyFileOpened(uri) }
                     )
                 }
             }

@@ -40,7 +40,6 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.markflow.editor.domain.model.FileSource
 import com.markflow.editor.domain.model.FileType
 import com.markflow.editor.domain.model.MarkdownFile
 import com.markflow.editor.domain.model.SortMode
@@ -320,15 +319,15 @@ fun FileListScreen(
 
                             // 根据搜索关键词过滤文件
                             val query = uiState.searchQuery
-                            val filteredImported = remember(uiState.importedFiles, query) {
-                                if (query.isBlank()) uiState.importedFiles
-                                else uiState.importedFiles.filter {
+                            val filteredRecent = remember(uiState.recentFiles, query) {
+                                if (query.isBlank()) uiState.recentFiles
+                                else uiState.recentFiles.filter {
                                     it.fileName.contains(query, ignoreCase = true)
                                 }
                             }
-                            val filteredLocal = remember(uiState.localFiles, query) {
-                                if (query.isBlank()) uiState.localFiles
-                                else uiState.localFiles.filter {
+                            val filteredMd = remember(uiState.mdFiles, query) {
+                                if (query.isBlank()) uiState.mdFiles
+                                else uiState.mdFiles.filter {
                                     it.fileName.contains(query, ignoreCase = true)
                                 }
                             }
@@ -366,13 +365,13 @@ fun FileListScreen(
                                         verticalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
                                         // "最近打开" 分区
-                                        if (filteredImported.isNotEmpty()) {
-                                            item(key = "section_imported") {
+                                        if (filteredRecent.isNotEmpty()) {
+                                            item(key = "section_recent") {
                                                 SectionHeader(title = "最近打开")
                                             }
                                             items(
-                                                items = filteredImported,
-                                                key = { "imported_${it.uri}" }
+                                                items = filteredRecent,
+                                                key = { "recent_${it.uri}" }
                                             ) { file ->
                                                 FileListItem(
                                                     file = file,
@@ -394,14 +393,14 @@ fun FileListScreen(
                                             }
                                         }
 
-                                        // "本地" 分区
-                                        if (filteredLocal.isNotEmpty()) {
-                                            item(key = "section_local") {
-                                                SectionHeader(title = "本地")
+                                        // "Markdown" 分区
+                                        if (filteredMd.isNotEmpty()) {
+                                            item(key = "section_md") {
+                                                SectionHeader(title = "Markdown")
                                             }
                                             items(
-                                                items = filteredLocal,
-                                                key = { "local_${it.uri}" }
+                                                items = filteredMd,
+                                                key = { "md_${it.uri}" }
                                             ) { file ->
                                                 FileListItem(
                                                     file = file,
@@ -453,7 +452,7 @@ fun FileListScreen(
                                         }
 
                                         // 搜索无结果提示
-                                        if (query.isNotBlank() && filteredImported.isEmpty() && filteredLocal.isEmpty() && filteredOther.isEmpty()) {
+                                        if (query.isNotBlank() && filteredRecent.isEmpty() && filteredMd.isEmpty() && filteredOther.isEmpty()) {
                                             item(key = "search_no_result") {
                                                 Box(
                                                     modifier = Modifier

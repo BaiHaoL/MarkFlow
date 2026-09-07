@@ -6,6 +6,7 @@ import android.content.Context
 import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.annotation.SuppressLint
 import android.app.RecoverableSecurityException
@@ -68,6 +69,18 @@ class StorageRepository @Inject constructor(
         private const val IMAGE_JPEG_QUALITY = 85
         /** 图片插入时存到 .md 文件同级目录的子目录名 */
         private const val IMAGE_ATTACHMENT_DIR = "images"
+        /** 让 MediaStore 忽略 images/ 目录的名（防止插入的图片被相册扫描） */
+        private const val IMAGE_NOMEDIA_NAME = ".nomedia"
+        /** 仅 Markdown 相关扩展名参与图片清理（非 .md 不产生 relative images/ 引用） */
+        private val MARKDOWN_EXTENSIONS = setOf("md", "markdown")
+        /** 图片清理时，超过该字节数的现存 .md 不整载做引用收集（保守保留，防 OOM） */
+        private const val MAX_MD_REFERRER_BYTES = 4 * 1024 * 1024
+        /** 本 app 自动生成的图片名（timestamp_random4.jpg，纯 ASCII）；仅此类文件才可被清理回收 */
+        private val REGEX_GENERATED_IMAGE = Regex("""\d+_\d+\.jpg""")
+        // Markdown 图片引用：![alt](images/xxx.png) ；捕获目标路径
+        private val REGEX_MD_IMAGE = Regex("""!\[[^\]]*]\(\s*([^)\s]+)\s*\)""")
+        // HTML 图片引用：<img src="images/xxx.png">
+        private val REGEX_HTML_IMG = Regex("""<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
     }
 
     // ==================== 文件扫描 ====================
@@ -525,8 +538,10 @@ class StorageRepository @Inject constructor(
     suspend fun copyImageForMarkdown(imageUriString: String, mdFileUriString: String): String? =
         withContext(Dispatchers.IO) {
             val mdUri = Uri.parse(mdFileUriString)
-            // 原图字节（分两次解码：先量尺寸、再采样解码）
-            val rawBytes = openRawStream(imageUriString)?.use { it.readBytes() } ?: return@withContext null
+            // 低内存路径：不再把整份源图 readBytes 载入，解码由 decodeDownscaledToJpeg 按 URI
+            // 直接流式/FD解码（file→decodeFile、content→decodeFileDescriptor，inSampleSize 生效）。
+            // 解码/压缩失败时返回 null，由各分支回退写入原始字节（保持原行为）。
+            val decodedJpeg = decodeDownscaledToJpeg(imageUriString)
 
             val imageName =
                 "${System.currentTimeMillis()}_${ThreadLocalRandom.current().nextInt(1000, 10000)}.jpg"
@@ -538,9 +553,13 @@ class StorageRepository @Inject constructor(
                 val destFile = File(File(mdParent, IMAGE_ATTACHMENT_DIR), imageName)
                 try {
                     destFile.parentFile?.mkdirs() ?: return@withContext null
-                    val outBytes = runCatching { decodeDownscaledToJpeg(rawBytes) }
-                        .getOrElse { rawBytes }
+                    // 解码成功写缩放图；失败则回退原始字节（仅此兜底路径才整读源图）
+                    val outBytes = decodedJpeg
+                        ?: openRawStream(imageUriString)?.use { it.readBytes() }
+                        ?: return@withContext null
                     destFile.outputStream().use { it.write(outBytes) }
+                    // 写入 .nomedia 使相册不显示本目录复制来的图片
+                    ensureImagesHiddenFromGallery(destFile.parentFile?.absolutePath)
                     relativePath
                 } catch (_: Exception) {
                     Log.e(TAG, "copyImageForMarkdown write file:// failed")
@@ -549,7 +568,6 @@ class StorageRepository @Inject constructor(
             } else {
                 // content://（MediaStore 文档）：insert 到 md 同目录的 images/ 子目录
                 val targetRelativePath = resolveMediaStoreDir(mdUri) + "/$IMAGE_ATTACHMENT_DIR/"
-                val outBytes = runCatching { decodeDownscaledToJpeg(rawBytes) }.getOrNull()
                 try {
                     val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
                     val values = ContentValues().apply {
@@ -562,15 +580,32 @@ class StorageRepository @Inject constructor(
                     }
                     val inserted = context.contentResolver.insert(collection, values)
                         ?: return@withContext null
-                    context.contentResolver.openOutputStream(inserted, "wt")?.use { os ->
-                        os.write(outBytes ?: rawBytes)
-                        os.flush()
+                    // 写流失败（null）时不应提交空/半截图片记录：删除已插入的行并放弃本次插入，
+                    // 避免 images/ 残留 0 字节损坏图、且避免向 .md 写入失效引用。
+                    val os = context.contentResolver.openOutputStream(inserted, "wt")
+                    if (os == null) {
+                        runCatching { context.contentResolver.delete(inserted, null, null) }
+                        return@withContext null
+                    }
+                    // 解码成功写缩放图；失败则回退原始字节（仅此兜底路径才整读源图）。
+                    // 若回退也失败，删除刚插入的行并放弃，绝不提交空/半截图。
+                    val toWrite = decodedJpeg ?: openRawStream(imageUriString)?.use { it.readBytes() }
+                    if (toWrite == null) {
+                        runCatching { context.contentResolver.delete(inserted, null, null) }
+                        return@withContext null
+                    }
+                    os.use {
+                        it.write(toWrite)
+                        it.flush()
                     }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         values.clear()
                         values.put(MediaStore.Files.FileColumns.IS_PENDING, 0)
                         context.contentResolver.update(inserted, values, null, null)
                     }
+                    // 主存储下 images/ 目录的物理路径（DocumentFile 场景可空，则跳过 .nomedia）
+                    val imagesDirPath = physicalImagesDirPath(targetRelativePath)
+                    ensureImagesHiddenFromGallery(imagesDirPath)
                     relativePath
                 } catch (_: Exception) {
                     Log.e(TAG, "copyImageForMarkdown write content:// failed")
@@ -599,47 +634,106 @@ class StorageRepository @Inject constructor(
     }
 
     /**
-     * 解码图片并压缩为 JPEG 字节流：长边缩放到 [IMAGE_MAX_EDGE_PX]，质量 [IMAGE_JPEG_QUALITY]。
-     * 用 inSampleSize 逼近目标后再精确缩放，避免一次性解码超大图导致 OOM。
+     * 在主存储上由 RELATIVE_PATH 求目录的物理绝对路径（仅 Android 10+ 的
+     * `Environment.getExternalStorageDirectory()` 可用时有效）。DocumentFile / 其他卷返回 null，
+     * 由调用方决定跳过 .nomedia 写入）。
      */
-    private fun decodeDownscaledToJpeg(rawBytes: ByteArray): ByteArray {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outMimeType == null) {
-            throw IOException("无法解码图片")
+    private fun physicalImagesDirPath(relativeImagesPath: String): String? {
+        return try {
+            val root = Environment.getExternalStorageDirectory().absolutePath
+            val clean = relativeImagesPath.trim('/')
+            if (clean.isBlank()) null else "$root/$clean".removeSuffix("/")
+        } catch (_: Exception) {
+            null
         }
+    }
 
-        var sample = 1
-        while (bounds.outWidth / (sample * 2) >= IMAGE_MAX_EDGE_PX ||
-            bounds.outHeight / (sample * 2) >= IMAGE_MAX_EDGE_PX
-        ) {
-            sample *= 2
-        }
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample.coerceAtLeast(1) }
-        val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, opts)
-            ?: throw IOException("解码图片失败")
-
-        var working = decoded
-        val maxDim = maxOf(working.width, working.height)
-        if (maxDim > IMAGE_MAX_EDGE_PX) {
-            val ratio = IMAGE_MAX_EDGE_PX.toFloat() / maxDim
-            working = Bitmap.createScaledBitmap(
-                decoded,
-                (working.width * ratio).toInt().coerceAtLeast(1),
-                (working.height * ratio).toInt().coerceAtLeast(1),
-                true
-            )
-            if (working !== decoded) decoded.recycle()
-        }
-
+    /**
+     * 在 images/ 目录放置 .nomedia 并触发媒体重扫，使 MediaStore 忽略该目录——
+     * 相册不再显示复制来的图片（物理文件保留，相对路径照常可用）。
+     * 任何失败都静默忽略，不阻断图片插入。
+     */
+    private fun ensureImagesHiddenFromGallery(imagesDirAbsolutePath: String?) {
+        if (imagesDirAbsolutePath.isNullOrBlank()) return
         try {
-            val out = ByteArrayOutputStream()
-            if (!working.compress(Bitmap.CompressFormat.JPEG, IMAGE_JPEG_QUALITY, out)) {
-                throw IOException("JPEG 压缩失败")
+            val nomedia = File(imagesDirAbsolutePath, IMAGE_NOMEDIA_NAME)
+            // 确保 .nomedia 存在（不存在则创建）
+            if (!nomedia.exists()) {
+                nomedia.parentFile?.mkdirs()
+                nomedia.createNewFile()
             }
-            return out.toByteArray()
-        } finally {
-            if (working !== decoded) working.recycle()
+            // 每次插入后都重扫该目录：MediaProvider 扫描到 .nomedia 会把本目录已索引图片记录移除，
+            // 保证"刚插入的那条记录"也能被清掉（否则只在首次创建 .nomedia 时扫一次，后续插入仍留在相册）
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(imagesDirAbsolutePath),
+                null,
+                null
+            )
+        } catch (_: Exception) {
+            Log.e(TAG, "write .nomedia failed; images may appear in gallery")
+        }
+    }
+
+    /**
+     * 解码图片并压缩为 JPEG 字节流：长边缩放到 [IMAGE_MAX_EDGE_PX]，质量 [IMAGE_JPEG_QUALITY]。
+     * 直接按 URI 解码（file→decodeFile / content→decodeFileDescriptor），不再先把整份源图 readBytes
+     * 载入内存，显著降低低内存机型插入大图时的峰值占用；inSampleSize 逼近目标后再精确缩放。
+     * 解码或压缩失败返回 null，由调用方回退写入原始字节。
+     */
+    private fun decodeDownscaledToJpeg(uriString: String): ByteArray? {
+        val uri = Uri.parse(uriString)
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            decodeViaSource(uri, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outMimeType == null) {
+                return null
+            }
+
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= IMAGE_MAX_EDGE_PX ||
+                bounds.outHeight / (sample * 2) >= IMAGE_MAX_EDGE_PX
+            ) {
+                sample *= 2
+            }
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample.coerceAtLeast(1) }
+            val decoded = decodeViaSource(uri, opts) ?: return null
+
+            var working = decoded
+            val maxDim = maxOf(working.width, working.height)
+            if (maxDim > IMAGE_MAX_EDGE_PX) {
+                val ratio = IMAGE_MAX_EDGE_PX.toFloat() / maxDim
+                working = Bitmap.createScaledBitmap(
+                    decoded,
+                    (working.width * ratio).toInt().coerceAtLeast(1),
+                    (working.height * ratio).toInt().coerceAtLeast(1),
+                    true
+                )
+                if (working !== decoded) decoded.recycle()
+            }
+
+            try {
+                val out = ByteArrayOutputStream()
+                if (!working.compress(Bitmap.CompressFormat.JPEG, IMAGE_JPEG_QUALITY, out)) {
+                    return null
+                }
+                out.toByteArray()
+            } finally {
+                if (working !== decoded) working.recycle()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 按 URI 对应的最省内存方式做一次解码：file→decodeFile，content→decodeFileDescriptor */
+    private fun decodeViaSource(uri: Uri, options: BitmapFactory.Options): Bitmap? {
+        return if (uri.scheme == "file") {
+            uri.path?.let { BitmapFactory.decodeFile(it, options) }
+        } else {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                BitmapFactory.decodeFileDescriptor(pfd.fileDescriptor, null, options)
+            }
         }
     }
 
@@ -709,6 +803,12 @@ class StorageRepository @Inject constructor(
      */
     @SuppressLint("NewApi") // RecoverableSecurityException(API29+) 仅 Android 11+ MediaStore 会抛出；旧系统不抛故 catch 安全，见方法内注释
     suspend fun deleteFiles(uris: List<String>): Set<String> = withContext(Dispatchers.IO) {
+        // 删除前置解析各待删 Markdown 所属 images/ 目录的物理路径：
+        // content:// URI 在文件删除后无法再查询 RELATIVE_PATH，若删除后再解析会回退到默认目录，
+        // 可能误清别的文档的 images/，故必须在删除前解析。非 md / 解析失败返回 null（不清理）。
+        val imagesParentsByUri = uris.associateWith {
+            runCatching { resolveMarkdownImagesParentDir(it) }.getOrNull()
+        }
         val batchSize = 16
         val succeeded = Collections.synchronizedSet(mutableSetOf<String>())
         val consentExceptions = Collections.synchronizedList(mutableListOf<SecurityConsentRequiredException>())
@@ -740,6 +840,11 @@ class StorageRepository @Inject constructor(
                 }
             }.awaitAll()
         }
+        // 删除成功后，仅对"删除成功且是 Markdown"的项做 images/ 未引用清理（引用计数式，见 cleanupSingleImagesDir）
+        val parentsToClean = succeeded.mapNotNull { imagesParentsByUri[it] }.toSet()
+        if (parentsToClean.isNotEmpty()) {
+            parentsToClean.forEach { cleanupSingleImagesDir(it) }
+        }
         // 如有需要用户授权的操作，汇总后抛给 UI 层处理：
         // - pendingOperation 携带全部待授权 URI，授权重试可覆盖整批（而非只重试第一个）；
         // - partialSucceeded 携带已成功删除的 URI，UI 层须先把它们从列表移除，
@@ -755,6 +860,99 @@ class StorageRepository @Inject constructor(
             )
         }
         succeeded
+    }
+
+    /**
+     * 解析待删文件所属 `images/` 目录的**物理路径**（须在文件删除前调用）。
+     *
+     * content:// URI 一旦被删除便无法再查询其 RELATIVE_PATH（会回退到默认目录，误清别的文档的
+     * images/），因此必须在此前置解析后，再由 [deleteFiles] 在删除成功后交给 [cleanupSingleImagesDir]。
+     *
+     * @return 所属 `images/` 目录的父目录物理绝对路径；非 Markdown / file 无法定位 / 其他卷返回 null
+     */
+    private fun resolveMarkdownImagesParentDir(uriString: String): String? {
+        val uri = Uri.parse(uriString)
+        // 仅 Markdown 会产生 relative images/ 引用。
+        // 扩展名必须从“文件名”推断，而非从 URI 字符串取：content://media/... 的 URI 不含扩展名
+        // （形如 file/45283），若用 substringAfterLast('.') 得空串，清理会被静默跳过（严重 bug）。
+        val ext = if (uri.scheme == "file") {
+            uri.path?.substringAfterLast('.', "")
+        } else {
+            getFileName(uriString)?.substringAfterLast('.', "")
+        }?.lowercase()
+        if (ext !in MARKDOWN_EXTENSIONS) return null
+        return if (uri.scheme == "file") {
+            uri.path?.let { File(it).parentFile?.absolutePath }
+        } else {
+            physicalImagesDirPath(resolveMediaStoreDir(uri))
+        }
+    }
+
+    /** 清理单个 .md 目录下的 images/：删除未被现存 Markdown 引用的图片副本 */
+    private fun cleanupSingleImagesDir(mdParentDirPath: String) {
+        try {
+            val imagesDir = File(mdParentDirPath, IMAGE_ATTACHMENT_DIR)
+            // 仅清理本 app 自动生成的图片副本（timestamp_random4.jpg）。用户手动放入/非自动命名
+            // 的图片一律保留，避免误删用户资源（REGEX 必须显式守卫，缺失即会误删）。
+            val candidates = imagesDir.listFiles { f ->
+                f.isFile && f.name != IMAGE_NOMEDIA_NAME && REGEX_GENERATED_IMAGE.matches(f.name)
+            } ?: return
+
+            // 收集该目录现存 .md 引用的图片文件名（仅解析指向 images/ 的相对引用）
+            val referenced = mutableSetOf<String>()
+            File(mdParentDirPath).listFiles { file ->
+                file.isFile && file.extension.lowercase() in MARKDOWN_EXTENSIONS
+            }?.forEach { md ->
+                try {
+                    // 超大 .md 不整载（避免瞬间占用大内存），跳过其引用收集。
+                    // 结果是该目录图片偏保守保留、不误删，符合安全优先。
+                    if (md.length() > MAX_MD_REFERRER_BYTES) return@forEach
+                    collectImageReferences(md.readText(Charsets.UTF_8), referenced)
+                } catch (_: Exception) {
+                    // 单个文件读取失败跳过，不影响其他
+                }
+            }
+
+            candidates.forEach { img ->
+                if (img.name !in referenced) {
+                    img.delete()
+                }
+            }
+        } catch (_: Exception) {
+            Log.e(TAG, "cleanupOrphanImages failed")
+        }
+    }
+
+    /** 从 Markdown 文本中收集指向 images/（[IMAGE_ATTACHMENT_DIR]）的相对图片引用文件名 */
+    private fun collectImageReferences(text: String, out: MutableSet<String>) {
+        // Markdown 语法：![alt](images/xx.png)  ；兼容引号形式
+        REGEX_MD_IMAGE.findAll(text).forEach { m ->
+            val path = m.groupValues[1].trim()
+            addReferenceIfInImages(path, out)
+        }
+        // HTML 语法：<img src="images/xx.png">
+        REGEX_HTML_IMG.findAll(text).forEach { m ->
+            val path = m.groupValues[1].trim('"', '\'', ' ').trim()
+            addReferenceIfInImages(path, out)
+        }
+    }
+
+    /** 仅当引用是指向本 `images/` 目录的相对路径时，记为引用（含子目录内文件按 basename 记） */
+    private fun addReferenceIfInImages(path: String, out: MutableSet<String>) {
+        if (path.isBlank()) return
+        // 拒绝绝对/协议路径/跳级路径，避免越界
+        if (path.startsWith("/") ||
+            path.contains("://") ||
+            path == ".." || path.startsWith("../")
+        ) return
+        val segments = path.split('/').map { it.trim() }.filter { it.isNotBlank() }
+        // 只要路径含 images/ 段就记为对 images/ 文件夹的引用（basename 匹配）。
+        // 不设层级上限：放宽更偏"多保留、少误删"（真实图片在 images/ 顶层，部分异常层级
+        // 引用亦能保住同名文件；代价仅是极端情况下个别孤儿图被保守保留）。
+        if (segments.contains(IMAGE_ATTACHMENT_DIR)) {
+            val name = segments.last()
+            if (name.isNotBlank() && !name.contains("..")) out.add(name)
+        }
     }
 
     // ==================== 文件重命名 ====================

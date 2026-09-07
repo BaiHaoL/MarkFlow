@@ -20,3 +20,7 @@ local.properties
 /*.log
 *.tmp
 *.bak
+
+# 项目文档与本地参考资料（不推送远端）
+/AGENTS.md
+/docs/

@@ -107,10 +107,56 @@ class PreferencesManager @Inject constructor(
 
     private fun readPosKey(uri: String) = "read_pos_$uri"
 
+    // ==================== 最近打开队列（「最近打开」分区，FIFO 有界队列） ====================
+
+    /**
+     * 读取最近打开的文件 URI 队列（按最近打开顺序，队首为最新）。
+     * 返回的列表为主调用方排序依据，顺序即"最近优先"。
+     */
+    fun getRecentUris(): List<String> {
+        val raw = prefs.getString(KEY_RECENT_URIS, null) ?: return emptyList()
+        return try {
+            val arr = org.json.JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * 将文件 URI 入「最近打开」队列：若已在队列则移到队首，否则插入队首；
+     * 超过 [RECENT_QUEUE_SIZE] 时挤出最旧条目。返回更新后（已修剪）的队列。
+     */
+    fun pushRecentUri(uri: String): List<String> {
+        val list = getRecentUris().toMutableList().apply { remove(uri) }
+        list.add(0, uri)
+        val trimmed = if (list.size > RECENT_QUEUE_SIZE) list.subList(0, RECENT_QUEUE_SIZE).toList() else list
+        persistRecentUris(trimmed)
+        return trimmed
+    }
+
+    /**
+     * 从「最近打开」队列移除指定文件（物理删除/隐藏时调用，避免残留失效条目）。
+     */
+    fun removeRecentUris(uris: Collection<String>): List<String> {
+        if (uris.isEmpty()) return getRecentUris()
+        val list = getRecentUris().toMutableList().apply { removeAll(uris) }
+        persistRecentUris(list)
+        return list
+    }
+
+    private fun persistRecentUris(list: List<String>) {
+        prefs.edit().putString(KEY_RECENT_URIS, org.json.JSONArray(list).toString()).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "markflow_preferences"
         private const val KEY_SORT_MODE = "sort_mode"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_HIDDEN_URIS = "hidden_uris"
+        private const val KEY_RECENT_URIS = "recent_uris"
+
+        /** 「最近打开」队列最大长度；语义为"文件被挤出最近打开前，有 N 次其它打开压过它"。可后续调整 */
+        const val RECENT_QUEUE_SIZE = 5
     }
 }

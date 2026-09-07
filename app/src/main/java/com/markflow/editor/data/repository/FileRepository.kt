@@ -30,9 +30,21 @@ class FileRepository @Inject constructor(
     private val _fileChangedEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val fileChangedEvent: SharedFlow<Unit> = _fileChangedEvent.asSharedFlow()
 
+    /** 文件被打开事件流，emit 打开的 URI，供 FileListViewModel 更新「最近打开」队列 */
+    private val _fileOpenedEvent = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val fileOpenedEvent: SharedFlow<String> = _fileOpenedEvent.asSharedFlow()
+
     /** 通知文件列表有变更（由 EditorViewModel 在保存成功后调用） */
     fun notifyFileChanged() {
         _fileChangedEvent.tryEmit(Unit)
+    }
+
+    /** 记录文件被打开（由打开文档的统一入口调用，用于「最近打开」入队） */
+    fun notifyFileOpened(uri: String) {
+        if (uri.isBlank()) return
+        // 原子更新队列：已在队 → 移队首；不在 → 插队首；超长 → 挤出最旧
+        preferencesManager.pushRecentUri(uri)
+        _fileOpenedEvent.tryEmit(uri)
     }
 
     /**

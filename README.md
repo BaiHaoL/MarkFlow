@@ -7,25 +7,28 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 ### 文件管理
 - 自动扫描文档目录（`Documents/`、`Download/`）中的 Markdown 及文本文件，不扫描全盘
 - 自动排除视频 / 音频 / 图片等媒体文件（如 `.ts` 视频），仅显示文本类文件
-- 文件分区：本地 / 最近打开 / 其他（非 Markdown 文本文件）
+- **三区互斥列表（从上到下）**：「最近打开」→「Markdown」→「其他」，每个文件只出现在一个分区
+  - **「最近打开」**：FIFO-5 队列（长度常量可调）。任何方式打开文件（列表点开 / 外部打开 / 分享 / 新建 / 导入）都会入队——已在队则置顶、不在则插队首、超 5 个挤出最旧者；被挤出的文件按类型回到「Markdown」或「其他」。队列顺序不受排序方式影响
+  - **「Markdown」**：`.md` / `.markdown` 文件（排除已在最近队列中的）
+  - **「其他」**：其余文本类文件（代码 / 配置 / 纯文本等，排除已在最近队列中的）
 - 支持多选：批量分享、批量删除；多文件分享走 `ACTION_SEND_MULTIPLE`
-- 排序：按修改时间 / 按文件名
+- 排序：按修改时间 / 按文件名（作用于 Markdown 与其他分区）
 - 单文件操作：重命名（可改后缀，后缀变化弹「更改扩展名」确认提示）、查看详情、分享
-- 新建文件（自定义文件名 + 后缀选择，默认 `.md`）
+- 新建文件（自定义文件名 + 后缀选择，默认 `.md`，约 21 种后缀）
 - 从手机导入已有文本文档（原子化写入 + 同名去重）
 - 保存文件后自动后台刷新列表，无闪烁更新
 - 外部文件来源统一净化文件名（防路径穿越）后导入应用私有目录
 
 ### 编辑器
-- 编辑 / 预览模式切换（顶部单图标互切：编辑=笔、预览=眼睛，同一位置），滚动位置记忆（切回编辑模式保持原位置）
-- 语法高亮提示（代码块、标题、列表等，覆盖 11 种 Markdown 元素）；按文档大小分流：≤64K 字符同步即时计算，>64K 字符后台线程 + 80ms 防抖异步计算（输入不卡顿）；超长文档自动降级高亮（跳过列表/引用/分隔线）
+- 编辑 / 预览模式切换：顶部**单图标互切**——编辑态显示"眼睛"（点击切到预览）、预览态显示"笔"（点击切回编辑）；滚动位置跨模式切换保留
+- 语法高亮提示（代码块、标题、列表等，覆盖 11 种 Markdown 元素）；按文档大小分流：≤64K 字符同步即时计算，>64K 字符后台线程 + 80ms 防抖异步计算（输入不卡顿）；超长文档自动降级高亮（跳过列表/引用/分隔线）；围栏代码块内部屏蔽所有高亮规则
 - 撤销 / 重做（含光标位置追踪），仅编辑模式显示
 - 自动保存（编辑停止输入 3 秒触发，不影响撤销/重做历史）
 - 自动格式化：列表续行（无序/有序/复选框）、缩进保留、有序列表自动编号、空列表项清理；仅 `.md` 文件启用
 - 手动保存 + 保存状态提示（未保存 / 保存中 / 已保存）
 - 退出时未保存更改确认（「保存并退出」/「放弃更改」）
-- 插入图片（复制到 `.md` 同级 `images/` 目录，压缩长边 2048px、JPEG 质量 85，命名 `{时间戳}_{随机4位}.jpg`）
-- 编辑工具栏图标顺序：**搜索 → 撤销 → 反撤销 → 插入图片**（搜索/撤销/重做/插入图片均为编辑模式专属）
+- **插入图片**：复制到 `.md` 同级 `images/` 目录（压缩长边 2048px、JPEG 质量 85、命名 `{时间戳}_{随机4位}.jpg`）；写入后自动放置 `.nomedia` 并触发媒体重扫，**复制来的图片不会出现在系统相册**；删除 `.md` 时自动清理该目录下不再被任何现存 `.md` 引用的自动命名图片副本（用户自放的图片绝不误删）
+- 编辑工具栏图标顺序：**搜索 → 撤销 → 反撤销 → 插入图片**（均为编辑模式专属）
 - 分段编辑兼容手写输入法（保留输入法组合区间，多笔正常成字）
 - 选中文本时自动隐藏键盘，避免复制框弹出输入法
 - 搜索：关键字匹配高亮、点击结果精确跳转并居中、关闭后保持当前位置不被光标拉回
@@ -69,10 +72,10 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 | 语言 | 100% Kotlin |
 | UI 框架 | Jetpack Compose + Material3 |
 | 架构 | MVVM + Clean Architecture |
-| 依赖注入 | Hilt |
+| 依赖注入 | Hilt（编译器走 KSP） |
 | 异步处理 | Kotlin Coroutines + Flow |
 | Markdown 渲染 | Markwon（latex / tables / tasklist / strikethrough / superscript / subscript 插件） |
-| 语法高亮 | Prism4j |
+| 语法高亮 | Prism4j（kapt 生成语法定义） |
 | LaTeX 渲染 | JLaTeXMath |
 | 图片加载 | Coil |
 | 导航 | Navigation Compose |
@@ -83,7 +86,7 @@ Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文�
 ```
 com.markflow.editor
 ├── data/
-│   ├── local/          # 本地偏好存储（排序、主题）
+│   ├── local/          # 本地偏好存储（排序、主题、最近打开队列）
 │   └── repository/     # 文件 I/O 仓库（扫描、读写、MediaStore/DocumentFile、编码检测、大文件分页）
 ├── domain/
 │   ├── model/          # 领域模型（FileType/FormatRegistry/SortMode/ThemeMode/EditorMode/MarkdownFile 等）
@@ -93,7 +96,7 @@ com.markflow.editor
 │   ├── navigation/     # 导航图与路由定义
 │   ├── screens/
 │   │   ├── editor/     # 编辑器页面 + ViewModel（含大文件分页只读 / 分段编辑）
-│   │   └── filelist/   # 文件列表页面 + ViewModel
+│   │   └── filelist/   # 文件列表页面 + ViewModel（三区互斥分区）
 │   └── theme/          # Material3 主题（浅色/深色手动切换）
 ├── util/               # 工具（Markwon 配置、Markdown 解析、TOC、语法高亮、自动格式化、上下标/LaTeX 对齐插件、编码检测、大文本分页读取、Prism4j 自定义语法）
 ├── io/noties/prism4j/languages/  # 自实现的 Prism4j 语法（bash, diff, dockerfile, toml, typescript）
@@ -121,6 +124,8 @@ com.markflow.editor
 # 清理构建产物
 .\gradlew.bat clean
 ```
+
+> 若构建报 Kotlin daemon 连接失败（`AccessDeniedException` / `Could not connect to Kotlin compile daemon`），先 `.\gradlew.bat --stop` 再重试。
 
 ### Debug 与 Release 区别
 

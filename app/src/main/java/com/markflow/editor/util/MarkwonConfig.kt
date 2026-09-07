@@ -439,7 +439,7 @@ object MarkwonConfig {
      * 图片路径预处理结果
      *
      * @param text 处理后的 Markdown 文本
-     * @param missingPlaceholders 所有被替换为占位文本"图片{alt}"的缺失图片占位串，
+     * @param missingPlaceholders 所有被替换为占位文本"图片：{alt}"的缺失图片占位串，
      *        用于渲染后统一施加灰色弱化样式
      */
     data class ImagePreprocessResult(
@@ -449,7 +449,7 @@ object MarkwonConfig {
 
     /**
      * 预处理 Markdown 中的图片路径
-     * - 相对路径 → 解析为绝对 file:// 路径；若目标文件不存在，替换为灰色占位文本"图片{alt}"
+     * - 相对路径 → 解析为绝对 file:// 路径；若目标文件不存在，替换为灰色占位文本"图片：{alt}"
      * - 不安全 URL（如 Mi Notes 自定义 URI）→ 替换为纯文本文件名
      * - 正常 HTTP URL → 保留原样
      */
@@ -472,9 +472,9 @@ object MarkwonConfig {
                     if (baseDir.isNotEmpty()) {
                         val resolvedPath = resolveRelativeImagePath(path, baseDir)
                         if (resolvedPath != null) {
-                            // 目标图片文件不存在 → 回退为占位文本"图片{alt}"，供预览渲染成灰色弱化
+                            // 目标图片文件不存在 → 回退为占位文本"图片：{alt}"，供预览渲染成灰色弱化
                             if (!File(resolvedPath).exists()) {
-                                val placeholder = if (alt.isEmpty()) "图片" else "图片$alt"
+                                val placeholder = if (alt.isEmpty()) "图片" else "图片：$alt"
                                 missingPlaceholders.add(placeholder)
                                 return@replace placeholder
                             }
@@ -579,7 +579,7 @@ object MarkwonConfig {
     const val MISSING_IMAGE_GRAY_DARK = 0xFF9AA0A6.toInt()
 
     /**
-     * 对渲染后的 TextView 中出现的缺失图片占位文本（"图片{alt}"）施加灰色弱化样式。
+     * 对渲染后的 TextView 中出现的缺失图片占位文本（"图片：{alt}"）施加灰色弱化样式。
      * 应在 markwon.setMarkdown 之后同步调用。
      */
     fun applyMissingImagePlaceholders(
