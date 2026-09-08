@@ -107,6 +107,36 @@ class PreferencesManager @Inject constructor(
 
     private fun readPosKey(uri: String) = "read_pos_$uri"
 
+    // ==================== 星标文件（无序集合；组内顺序交由全局排序决定） ====================
+
+    /**
+     * 获取星标文件 URI 集合（无序）。
+     * 星标组始终在各自分区内置顶；组内顺序由全局 SortMode 决定，故无需维护打星时序。
+     */
+    fun getStarredUris(): Set<String> {
+        return prefs.getStringSet(KEY_STARRED_URIS, emptySet()) ?: emptySet()
+    }
+
+    /**
+     * 设置/取消指定文件的星标状态。
+     * @param starred true=打星（加入集合），false=取消（移除）
+     */
+    fun setStarred(uri: String, starred: Boolean) {
+        val current = getStarredUris().toMutableSet()
+        if (starred) current.add(uri) else current.remove(uri)
+        prefs.edit().putStringSet(KEY_STARRED_URIS, current).apply()
+    }
+
+    /**
+     * 从星标集合移除指定文件（物理删除/隐藏时调用，避免残留失效 URI）。
+     */
+    fun removeStarredUris(uris: Collection<String>) {
+        if (uris.isEmpty()) return
+        val current = getStarredUris().toMutableSet()
+        current.removeAll(uris)
+        prefs.edit().putStringSet(KEY_STARRED_URIS, current).apply()
+    }
+
     // ==================== 最近打开队列（「最近打开」分区，FIFO 有界队列） ====================
 
     /**
@@ -154,6 +184,7 @@ class PreferencesManager @Inject constructor(
         private const val KEY_SORT_MODE = "sort_mode"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_HIDDEN_URIS = "hidden_uris"
+        private const val KEY_STARRED_URIS = "starred_uris"
         private const val KEY_RECENT_URIS = "recent_uris"
 
         /** 「最近打开」队列最大长度；语义为"文件被挤出最近打开前，有 N 次其它打开压过它"。可后续调整 */

@@ -377,6 +377,7 @@ fun FileListScreen(
                                                     file = file,
                                                     isSelected = uiState.selectedFiles.contains(file.uri),
                                                     isSelectionMode = uiState.isSelectionMode,
+                                                    isStarred = uiState.starredUris.contains(file.uri),
                                                     onClick = {
                                                         if (uiState.isSelectionMode) {
                                                             viewModel.toggleFileSelection(file.uri)
@@ -388,7 +389,8 @@ fun FileListScreen(
                                                         if (!uiState.isSelectionMode) {
                                                             viewModel.enterSelectionMode(file.uri)
                                                         }
-                                                    }
+                                                    },
+                                                    onToggleStar = { viewModel.toggleStar(file.uri) }
                                                 )
                                             }
                                         }
@@ -406,6 +408,7 @@ fun FileListScreen(
                                                     file = file,
                                                     isSelected = uiState.selectedFiles.contains(file.uri),
                                                     isSelectionMode = uiState.isSelectionMode,
+                                                    isStarred = uiState.starredUris.contains(file.uri),
                                                     onClick = {
                                                         if (uiState.isSelectionMode) {
                                                             viewModel.toggleFileSelection(file.uri)
@@ -417,7 +420,8 @@ fun FileListScreen(
                                                         if (!uiState.isSelectionMode) {
                                                             viewModel.enterSelectionMode(file.uri)
                                                         }
-                                                    }
+                                                    },
+                                                    onToggleStar = { viewModel.toggleStar(file.uri) }
                                                 )
                                             }
                                         }
@@ -435,6 +439,7 @@ fun FileListScreen(
                                                     file = file,
                                                     isSelected = uiState.selectedFiles.contains(file.uri),
                                                     isSelectionMode = uiState.isSelectionMode,
+                                                    isStarred = uiState.starredUris.contains(file.uri),
                                                     onClick = {
                                                         if (uiState.isSelectionMode) {
                                                             viewModel.toggleFileSelection(file.uri)
@@ -446,7 +451,8 @@ fun FileListScreen(
                                                         if (!uiState.isSelectionMode) {
                                                             viewModel.enterSelectionMode(file.uri)
                                                         }
-                                                    }
+                                                    },
+                                                    onToggleStar = { viewModel.toggleStar(file.uri) }
                                                 )
                                             }
                                         }
@@ -909,8 +915,10 @@ private fun FileListItem(
     file: MarkdownFile,
     isSelected: Boolean,
     isSelectionMode: Boolean,
+    isStarred: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit
+    onLongClick: () -> Unit,
+    onToggleStar: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()) }
     // 大文件判定（>512KB 的文本文件，含 md，统一阈值）→ 显示"大"角标。
@@ -964,12 +972,34 @@ private fun FileListItem(
             Column(
                 modifier = Modifier.weight(1f)
             ) {
-                Text(
-                    text = file.fileName,
-                    style = MaterialTheme.typography.bodyLarge,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                // 文件名行：左侧小星标（可独立点按切换星标，不触发整行点击/多选）
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (isStarred) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                        contentDescription = if (isStarred) "取消星标" else "星标",
+                        tint = if (isStarred)
+                            Color(0xFFFFC107)
+                        else
+                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                        modifier = Modifier
+                            .size(20.dp)
+                            // 独立热区点按，避免与外层 combinedClickable（打开/多选）冲突
+                            .clip(MaterialTheme.shapes.small)
+                            .clickable(indication = null, interactionSource = remember { MutableInteractionSource() }) {
+                                onToggleStar()
+                            }
+                            .padding(end = 6.dp)
+                    )
+                    Text(
+                        text = file.fileName,
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),

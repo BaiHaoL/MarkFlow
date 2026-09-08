@@ -770,11 +770,11 @@ class StorageRepository @Inject constructor(
                     MediaStore.Files.getContentUri("external")
                 }
 
-                val uri = context.contentResolver.insert(collection, contentValues)
+                val insertedUri = context.contentResolver.insert(collection, contentValues)
                     ?: return@withContext null
 
                 // 写入初始内容
-                context.contentResolver.openOutputStream(uri, "wt")?.use { os ->
+                context.contentResolver.openOutputStream(insertedUri, "wt")?.use { os ->
                     os.write(content.toByteArray(Charsets.UTF_8))
                     os.flush()
                 }
@@ -783,10 +783,21 @@ class StorageRepository @Inject constructor(
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     contentValues.clear()
                     contentValues.put(MediaStore.Files.FileColumns.IS_PENDING, 0)
-                    context.contentResolver.update(uri, contentValues, null, null)
+                    context.contentResolver.update(insertedUri, contentValues, null, null)
                 }
 
-                uri.toString()
+                // 统一 URI 形式：插入用 VOLUME_EXTERNAL_PRIMARY（写主卷），但扫描列表
+                // （queryMediaStore）用 VOLUME_EXTERNAL 生成 uri。若直接返回 insertedUri，
+                // 「最近打开」队列存的是 external_primary 形式，分区解析时与 pool 中的
+                // external 形式匹配不上，新建文件不会出现在「最近打开」。此处按扫描同款
+                // collection 以 id 重建，保证入队 URI 与数据池一致。
+                val id = ContentUris.parseId(insertedUri)
+                val scanCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                } else {
+                    MediaStore.Files.getContentUri("external")
+                }
+                ContentUris.withAppendedId(scanCollection, id).toString()
             } catch (e: Exception) {
                 Log.e(TAG, "Operation failed", e)
                 null
@@ -1266,7 +1277,18 @@ class StorageRepository @Inject constructor(
                 context.contentResolver.update(destUri, contentValues, null, null)
             }
 
-            destUri.toString()
+            // 统一 URI 形式：import 用 VOLUME_EXTERNAL_PRIMARY 写入，但扫描列表
+            // （queryMediaStore）用 VOLUME_EXTERNAL 生成 uri。若直接返回 destUri，
+            // 「最近打开」队列存的是 external_primary 形式，分区解析时与 pool 中的
+            // external 形式匹配不上，导入后自动打开的文件不会出现在「最近打开」。
+            // 此处按扫描同款 collection 以 id 重建（同 createFile 的既定策略）。
+            val id = ContentUris.parseId(destUri)
+            val scanCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else {
+                MediaStore.Files.getContentUri("external")
+            }
+            ContentUris.withAppendedId(scanCollection, id).toString()
         } catch (e: Exception) {
             Log.e(TAG, "Operation failed", e)
             null

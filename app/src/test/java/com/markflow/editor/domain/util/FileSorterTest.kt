@@ -196,4 +196,38 @@ class FileSorterTest {
         assertEquals(6789, sorted[0].fileSize)
         assertEquals(com.markflow.editor.domain.model.FileSource.IMPORTED, sorted[0].source)
     }
+
+    // ==================== sortWithStar 星标置顶 ====================
+
+    @Test
+    fun `sortWithStar_starred_group_always_first_by_name`() {
+        val starA = file("b1.md", 200)
+        val starB = file("a1.md", 100)
+        val normalC = file("c1.md", 50)
+        val normalD = file("d1.md", 60)
+        val files = listOf(normalC, starA, normalD, starB)
+        val starred = setOf(starA.uri, starB.uri)
+
+        val sorted = FileSorter.sortWithStar(files, SortMode.BY_NAME, starred)
+        // 星标组置顶，组内按名称序；随后非星标组按名称序
+        assertEquals(listOf("a1.md", "b1.md", "c1.md", "d1.md"), sorted.map { it.fileName })
+    }
+
+    @Test
+    fun `sortWithStar_starred_group_by_time_inside_by_name_mode`() {
+        val starOld = file("b.md", 100)
+        val starNew = file("a.md", 300)
+        val files = listOf(file("zz.md", 500), starOld, starNew, file("cc.md", 0))
+
+        val sorted = FileSorter.sortWithStar(files, SortMode.BY_TIME_DESC, setOf(starOld.uri, starNew.uri))
+        // 星标组置顶，组内按时间降序：starNew(300) > starOld(100)；非星标按时间降序：zz(500) > cc(0)
+        assertEquals(listOf("a.md", "b.md", "zz.md", "cc.md"), sorted.map { it.fileName })
+    }
+
+    @Test
+    fun `sortWithStar_empty_starred_delegates_to_sort`() {
+        val files = listOf(file("z.md", 100), file("a.md", 200))
+        val sorted = FileSorter.sortWithStar(files, SortMode.BY_NAME, emptySet())
+        assertEquals(listOf("a.md", "z.md"), sorted.map { it.fileName })
+    }
 }

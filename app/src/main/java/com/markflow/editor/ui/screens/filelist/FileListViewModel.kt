@@ -31,6 +31,8 @@ data class FileListUiState(
     val otherFiles: List<MarkdownFile> = emptyList(),
     /** 合并后的文件列表（用于多选、搜索等操作） */
     val files: List<MarkdownFile> = emptyList(),
+    /** 当前星标的文件 URI 集合（UI 据其显示星标图标） */
+    val starredUris: Set<String> = emptySet(),
     val isLoading: Boolean = false,
     val sortMode: SortMode = SortMode.BY_TIME_DESC,
     /** 搜索关键词（过滤文件名） */
@@ -193,8 +195,9 @@ class FileListViewModel @Inject constructor(
         }
 
         val rest = pool.filter { it.uri !in recentUriSet }
-        val md = FileSorter.sort(rest.filter { it.isMarkdown }, sortMode)
-        val other = FileSorter.sort(rest.filter { !it.isMarkdown }, sortMode)
+        val starredUris = preferencesManager.getStarredUris()
+        val md = FileSorter.sortWithStar(rest.filter { it.isMarkdown }, sortMode, starredUris)
+        val other = FileSorter.sortWithStar(rest.filter { !it.isMarkdown }, sortMode, starredUris)
 
         _uiState.update {
             it.copy(
@@ -203,6 +206,7 @@ class FileListViewModel @Inject constructor(
                 mdFiles = md,
                 otherFiles = other,
                 files = recentFiles + md + other,
+                starredUris = starredUris,
                 isLoading = if (updateLoading) false else it.isLoading,
                 errorMessage = null
             )
@@ -217,8 +221,9 @@ class FileListViewModel @Inject constructor(
         preferencesManager.setSortMode(mode)
         // 最近打开保持 recency 顺序，不受排序影响；仅重排 Markdown/其他 两区
         _uiState.update {
-            val sortedMd = FileSorter.sort(it.mdFiles, mode)
-            val sortedOther = FileSorter.sort(it.otherFiles, mode)
+            val starredUris = preferencesManager.getStarredUris()
+            val sortedMd = FileSorter.sortWithStar(it.mdFiles, mode, starredUris)
+            val sortedOther = FileSorter.sortWithStar(it.otherFiles, mode, starredUris)
             it.copy(
                 sortMode = mode,
                 mdFiles = sortedMd,
@@ -279,6 +284,28 @@ class FileListViewModel @Inject constructor(
     // ==================== 文件操作 ====================
 
     /**
+     * 切换指定文件的星标状态。打星/取消后立刻重排各分区（星标组置顶），
+     * 并更新星标标记。最近打开分区顺序不受影响（仅标记）。
+     */
+    fun toggleStar(uri: String) {
+        val starred = preferencesManager.getStarredUris()
+        preferencesManager.setStarred(uri, uri !in starred)
+        val sortMode = _uiState.value.sortMode
+        val remainingStarred = preferencesManager.getStarredUris()
+
+        _uiState.update { current ->
+            val sortedMd = FileSorter.sortWithStar(current.mdFiles, sortMode, remainingStarred)
+            val sortedOther = FileSorter.sortWithStar(current.otherFiles, sortMode, remainingStarred)
+            current.copy(
+                mdFiles = sortedMd,
+                otherFiles = sortedOther,
+                files = current.recentFiles + sortedMd + sortedOther,
+                starredUris = remainingStarred
+            )
+        }
+    }
+
+    /**
      * 删除选中的文件。
      * - deleteWithFile = true：物理删除文件本身；
      * - deleteWithFile = false（默认）：仅从软件文件列表移除，文件保留在设备上。
@@ -306,6 +333,8 @@ class FileListViewModel @Inject constructor(
                     fileRepository.unhideFiles(e.partialSucceeded.toList())
                     // 已删除文件同步移出「最近打开」队列
                     preferencesManager.removeRecentUris(e.partialSucceeded)
+                    // 已删除文件同步移出「星标」集合，防止残留失效 URI
+                    preferencesManager.removeStarredUris(e.partialSucceeded)
                     _uiState.update { current ->
                         current.copy(
                             recentFiles = current.recentFiles.filterNot { it.uri in e.partialSucceeded },
@@ -329,6 +358,8 @@ class FileListViewModel @Inject constructor(
             // 删除/隐藏成功 → 同步移出「最近打开」队列，保证分区互斥
             if (removedUris.isNotEmpty()) {
                 preferencesManager.removeRecentUris(removedUris)
+                // 已删除/隐藏文件同步移出「星标」集合
+                preferencesManager.removeStarredUris(removedUris)
             }
 
             _uiState.update { current ->

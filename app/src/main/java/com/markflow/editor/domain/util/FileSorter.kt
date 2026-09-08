@@ -30,6 +30,22 @@ object FileSorter {
     }
 
     /**
+     * 星标置顶排序：星标组整体排在前面（不参与全局排序位置），
+     * 但星标组内部与非星标组内部各自仍按 [sortMode] 排序。
+     *
+     * 效果：无论排序模式如何，星标文件恒置顶；各组内顺序随模式改变（时间/名称）。
+     */
+    fun sortWithStar(
+        files: List<MarkdownFile>,
+        sortMode: SortMode,
+        starredUris: Set<String>
+    ): List<MarkdownFile> {
+        if (starredUris.isEmpty()) return sort(files, sortMode)
+        val (starGroup, rest) = files.partition { it.uri in starredUris }
+        return sort(starGroup, sortMode) + sort(rest, sortMode)
+    }
+
+    /**
      * 按文件名升序排序（大小写不敏感）
      * 相同文件名时按修改时间降序作为二级排序
      */
