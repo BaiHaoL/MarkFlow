@@ -11,14 +11,13 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.layout.only
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -44,6 +43,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.SpanStyle
@@ -63,6 +63,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -177,6 +179,9 @@ fun EditorScreen(
 
     var textFieldValue by remember { mutableStateOf(TextFieldValue(text = "")) }
     var isInternalUpdate by remember { mutableStateOf(false) }
+    // 跟踪"上一次输入/内容更新后"的 TextFieldValue，供 AutoTextFormatter 的列表续行/清理
+    // 取正确的前文本。必须在撤销/重做等"直接覆盖 textFieldValue"的路径里同步（见下方 LaunchedEffect）。
+    val previousTextFieldValue = remember { mutableStateOf(textFieldValue) }
 
     LaunchedEffect(uiState.currentContent) {
         if (!isInternalUpdate && textFieldValue.text != uiState.currentContent) {
@@ -190,6 +195,10 @@ fun EditorScreen(
                 text = newContent,
                 selection = TextRange(cursorPos)
             )
+            // 同步"上一次输入前文本"：撤销/重做直接覆盖 textFieldValue 时也必须同步
+            // previousTextFieldValue，否则下次键入时 AutoTextFormatter 的列表续行/空项清理
+            // 会拿到撤销前的陈旧前文（M2）
+            previousTextFieldValue.value = textFieldValue
             // 应用后清除标记，避免后续内容更新重复使用
             if (uiState.pendingCursorPos != null) {
                 viewModel.clearPendingCursor()
@@ -427,15 +436,34 @@ fun EditorScreen(
                     )
                 }
 
-                // 主内容区域：仅处理底部IME内边距，减少键盘动画期间的重组范围
+                // 主内容区域。键盘避让：不用 windowInsetsPadding(ime)（其随键盘动画逐帧变化，触发整篇
+                // 滚动容器逐帧重排重绘 →「所有文件」键盘开/关卡顿，A/B-IME 2026-09-17 已证）。
+                // 改「settle 后一次性垫入」：键盘弹起等高度稳定后单次加 bottom padding，仅一次
+                // 布局，光标可顶到键盘上方且不卡；收起清零。
+                var keyboardBottomPx by remember { mutableStateOf(0) }
+                val editorView = LocalView.current
+                // 一次性垫高上限：防某些时机读到异常大 IME insets 把内容区挤成近 0 高（文本全空白）
+                val keyboardCapPx = with(LocalDensity.current) { 520.dp.roundToPx() }
+                LaunchedEffect(imeVisibleNow) {
+                    if (imeVisibleNow) {
+                        delay(300) // 等键盘动画基本结束，读到稳定高度
+                        // 用 View 的 IME insets 求键盘高度：edge-to-edge 下 getInsets(Type.ime()) 正确
+                        // 反映键盘占用，且非 @Composable 可在协程读取（WindowInsets.ime 在协程会报 @Composable）
+                        val wic = ViewCompat.getRootWindowInsets(editorView)
+                        val raw = wic?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
+                        keyboardBottomPx = raw.coerceIn(0, keyboardCapPx)
+                    } else {
+                        keyboardBottomPx = 0
+                    }
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .windowInsetsPadding(WindowInsets.ime.only(WindowInsetsSides.Bottom))
+                        // 内容区保持满高（不随键盘压缩）：压缩高度（padding 或 Spacer 兄弟占位）会
+                        // 令 verticalScroll 内容整棵从组合/无障碍树消失→屏幕空白（2026-09-18 A/B 实证，
+                        // 文本只随键盘隐藏）。光标是否被键盘遮挡改由 EditContentView 的光标跟随
+                        // 以 keyboardOffsetPx 抬升光标解决，见下方 EditContentView。
                 ) {
-                    // 用 ref 跟踪上一次的 TextFieldValue，确保 AutoTextFormatter 拿到正确的前值
-                    val previousTextFieldValue = remember { mutableStateOf(textFieldValue) }
-
                     when (uiState.editorMode) {
                         EditorMode.EDIT -> {
                             if (uiState.isReadOnlyPaged) {
@@ -482,7 +510,8 @@ fun EditorScreen(
                                     currentSearchIndex = uiState.currentSearchIndex,
                                     onLayoutResult = { editLayoutResult = it },
                                     focusRequester = editFocusRequester,
-                                    onFocusChanged = { isEditorFocused = it }
+                                    onFocusChanged = { isEditorFocused = it },
+                                    keyboardOffsetPx = keyboardBottomPx
                                 )
                             }
                         }
@@ -1061,7 +1090,9 @@ private fun EditContentView(
     currentSearchIndex: Int = -1,
     onLayoutResult: (TextLayoutResult) -> Unit = {},
     focusRequester: FocusRequester = remember { FocusRequester() },
-    onFocusChanged: (Boolean) -> Unit = {}
+    onFocusChanged: (Boolean) -> Unit = {},
+    /** 键盘高度(px)：光标跟随把"安全可见底边"上移到 viewport-top 上方固定偏移，保证光标不被键盘遮挡 */
+    keyboardOffsetPx: Int = 0
 ) {
     // 语法高亮：仅在 Markdown 文件且非搜索状态时启用
     val markdownHighlighter = remember(isDarkTheme) {
@@ -1093,7 +1124,7 @@ private fun EditContentView(
     // 不能直接返回 markdownHighlighter：BasicTextField 对同一 VT 实例引用会跳过
     // filter 重跑，必须每次 highlightVersion 变化时创建新包装实例强制重跑。
     val visualTransformation = remember(
-        searchQuery, searchMatches, currentSearchIndex, isMarkdown, highlightVersion
+        searchQuery, searchMatches, currentSearchIndex, isMarkdown, isDarkTheme, highlightVersion
     ) {
         when {
             searchQuery.isNotEmpty() && searchMatches.isNotEmpty() ->
@@ -1119,6 +1150,14 @@ private fun EditContentView(
     // 不随重组更新，闭包会捕获【首次组合时】的 textFieldValue(空文本)而永远读到陈旧值，导致
     // B′ 落点因 text.isEmpty() 恒真而永不执行。用 rememberUpdatedState 使 B′ 始终读到最新值。
     val currentTextFieldValue by rememberUpdatedState(textFieldValue)
+    // 首获聚焦对齐：(2026-09-18 真机) 记录最近一次 down 时外层 verticalScroll 的滚动量，
+    // 首次聚焦时先把外层滚动对齐到该处，使聚焦 reveal 判定时光标已在 TextField 自身可视区
+    // （近似），reveal no-op 而不再拉外层跳顶。见下方 onFocusChanged 注释。
+    var lastDownV by remember { mutableIntStateOf(0) }  // 本次 down 时外层滚动量
+    var wasTextFieldFocused by remember { mutableStateOf(false) }
+    // 首获聚焦在 onFocusChanged 回调内（非 suspend，无现成 scope）发起延迟对齐滚动，
+    // 需自建协程 scope；仅首个聚焦回调用一次。
+    val focusScope = rememberCoroutineScope()
     // 滚动容器可视高度(px)：空文件文本仅一行时，用它给 BasicTextField 设 minHeight 铺满
     // 整屏，使点击首行以下的空白也能落在文本控件上而聚焦；不能用 fillMaxHeight——
     // 外层 verticalScroll 给子节点的高度约束是无限大，会被拉成无穷高而运行时崩溃。
@@ -1151,7 +1190,24 @@ private fun EditContentView(
                     // 最小高度铺满可视区：空文件文本仅一行时让点击空白也能聚焦（见上 editAreaHeightPx）
                     .heightIn(min = with(density) { editAreaHeightPx.toDp() })
                     .focusRequester(focusRequester)
-                    .onFocusChanged { onFocusChanged(it.isFocused) }
+                    .onFocusChanged { fs ->
+                        onFocusChanged(fs.isFocused)
+                        // 【首获聚焦跳顶根治】(2026-09-18 真机定案)
+                        // 根因：BasicTextField 聚焦 reveal 用「自身滚动 offset=0」判定光标是否可见；
+                        // 外层 verticalScroll 已滚动(如 v=11140)且光标在屏外(y≈12164)时，reveal 判定其
+                        // 不可见 → 一步把外层拉到顶(跳顶)，随后键盘 settle 后 cursor-follow 又 scrollTo
+                        // 送回(回弹)。与 setSelection 无关(原生 tap 已证自行落到点按处)。
+                        // 修复：首次聚焦时先把外层滚动对齐到本次点按前的滚动量(lastDownV)，使 reveal
+                        // 判定时光标已在 TextField 自身"可视区"内(近似) → reveal no-op，不再拉外层。
+                        // 跨第一屏点按 / 滚动后点按 / 快速连点均稳定，零跳顶。
+                        if (fs.isFocused && !wasTextFieldFocused) {
+                            wasTextFieldFocused = true
+                            focusScope.launch {
+                                delay(48)
+                                scrollState.scrollTo(lastDownV.coerceIn(0, scrollState.maxValue))
+                            }
+                        }
+                    }
                     // 【X-H6 B′ 根治·长按前锚定落点】(2026-09-05 真机定案)
                     //
                     // 背景：BasicTextField 旧 API 在"折叠逻辑光标停在不随视口的幽灵 offset 0"时
@@ -1174,13 +1230,42 @@ private fun EditContentView(
                     //  2) 仅折叠态(collapsed)才干预，避免打断正在进行的框选拖动(非折叠)。
                     //  3) setSelection 触发的"光标跟随"会检查新光标(即 down 点，必在视口内，
                     //     因用户看得见才长按)→ 不触发 scrollTo，无副作用。
+                    //
+                    // 【驻留判定】(2026-09-17)：落点前置一个"按住"判定——手指按下后在窗口期
+                    // (120ms)内未超出 touch slop 位移，才视为「按住」(长按/慢点按)并就近落点；
+                    // 拖动滚动(手指快速位移)或快速点按则不落点。目的：修掉原实现"任何 down 都
+                    // 落点"导致【触摸拖动滚动时光标被吸附到手指处 + selection 变更每次都整篇
+                    // 重组 + cursor-follow(以 selection 为 key)重跑】的卡顿与误落点。120ms ≪
+                    // 系统长按阈值(约 500ms)，长按前锚定不受影响；快速点按由 TextField 原生处理，
+                    // 此处跳过无副作用。
                     .pointerInput(Unit) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
+                            val startPos = down.position
+                            val slop = viewConfiguration.touchSlop
+                            // 记录本次 down 时外层滚动量（供首获聚焦对齐用），无论快按/按住/拖动都记；
+                            // 点按聚焦场景即这段时间的滚动位置。
+                            lastDownV = scrollState.value
+                            // 超时(120ms 内未位移超 slop → null)视为「按住」；true=位移/抬起
+                            val movedOrReleased = withTimeoutOrNull(120L) {
+                                var moved = false
+                                while (!moved) {
+                                    val change = awaitPointerEvent()
+                                        .changes.firstOrNull { it.id == down.id } ?: continue
+                                    if (change.pressed &&
+                                        (change.position - startPos).getDistance() > slop
+                                    ) {
+                                        moved = true // 手指明显位移 → 拖动/滚动
+                                    } else if (!change.pressed) {
+                                        moved = true // 快速抬起(点按) → 原生处理
+                                    }
+                                }
+                                moved
+                            } ?: false
+                            if (movedOrReleased) return@awaitEachGesture
+                            // 按住：就近落点（用 rememberUpdatedState 的 currentTextFieldValue 而非
+                            // 裸 textFieldValue，见上方 X-H6 说明）。
                             val layout = layoutResult
-                            // 用 rememberUpdatedState 的 currentTextFieldValue 而非裸 textFieldValue：
-                            // pointerInput 块不随重组重启，闭包读裸参数会拿到首次组合的陈旧空文本，
-                            // 导致落点永不执行(跳顶根因)。currentTextFieldValue 始终是当前最新值。
                             val text = currentTextFieldValue.text
                             val sel = currentTextFieldValue.selection
                             if (layout != null && text.isNotEmpty() && sel.collapsed) {
@@ -1240,7 +1325,10 @@ private fun EditContentView(
                 wasSearchActive = false
             }
         }
-        LaunchedEffect(textFieldValue.selection, scrollState.maxValue) {
+        // 键盘开启时，把"安全可见底边"上移 keyboardOffsetPx，光标跟随将光标所在行抬到键盘上方，
+        // 既不被键盘遮挡，也不压缩内容区（压缩会让内容空白）。
+        // keyboardOffsetPx 纳入 key：键盘 settle 后（parent 已写入键盘高度）触发一次重新定位。
+        LaunchedEffect(textFieldValue.selection, scrollState.maxValue, keyboardOffsetPx) {
             if (searchQuery.isNotEmpty()) return@LaunchedEffect
             if (suppressCursorFollowUntilEdit) return@LaunchedEffect
             if (skipCursorFollow) {
@@ -1250,14 +1338,18 @@ private fun EditContentView(
             val layout = layoutResult ?: return@LaunchedEffect
             val selection = textFieldValue.selection
             val viewport = scrollState.viewportSize
+            val safeBottom = (viewport - keyboardOffsetPx).coerceAtLeast(0)
             if (selection.collapsed && viewport > 0) {
                 val cursorRect = layout.getCursorRect(selection.start)
                 val viewportTop = scrollState.value.toFloat()
-                val viewportBottom = viewportTop + viewport.toFloat()
-                if (cursorRect.top < viewportTop || cursorRect.bottom > viewportBottom) {
-                    val target = (cursorRect.top - viewport / 3f)
-                        .coerceIn(0f, scrollState.maxValue.toFloat())
-                    scrollState.scrollTo(target.toInt())
+                if (cursorRect.top < viewportTop || cursorRect.bottom > viewportTop + safeBottom) {
+                    val target = if (cursorRect.top < viewportTop) {
+                        (cursorRect.top - viewport / 3f)
+                    } else {
+                        // 光标被键盘遮（在安全底边之下）→ 将其底边上移到安全底边再留一点空隙
+                        (cursorRect.bottom - safeBottom + safeBottom * 0.1f)
+                    }
+                    scrollState.scrollTo(target.coerceIn(0f, scrollState.maxValue.toFloat()).toInt())
                 }
             }
         }

@@ -12,12 +12,21 @@ import com.markflow.editor.domain.model.SecurityConsentRequiredException
 import com.markflow.editor.domain.model.SortMode
 import com.markflow.editor.domain.util.FileSorter
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
+
+/**
+ * 文件列表加载超时（毫秒）。MediaStore 查询异常卡死/极慢未返回时，
+ * [loadFiles]/[silentRefresh] 通过 withTimeoutOrNull 兜底释放加载态，
+ * 避免「没有文件」场景下加载转圈永远不消失。正常扫描秒级返回，远低于该值。
+ */
+private const val LOAD_TIMEOUT_MILLIS = 15_000L
 
 /**
  * 文件列表页 UI 状态
@@ -125,23 +134,40 @@ class FileListViewModel @Inject constructor(
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
             val sortMode = _uiState.value.sortMode
-            fileRepository.getFiles(sortMode)
-                .catch { e ->
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            errorMessage = "加载文件失败: ${e.message}"
-                        )
-                    }
+            try {
+                val completed = withTimeoutOrNull(LOAD_TIMEOUT_MILLIS) {
+                    fileRepository.getFiles(sortMode)
+                        .catch { e ->
+                            _uiState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    errorMessage = "加载文件失败: ${e.message}"
+                                )
+                            }
+                        }
+                        .collect { allFiles ->
+                            // 私有目录扫描（filesDir）同步 I/O 放 IO 线程，避免阻塞主线程
+                            val imported = withContext(Dispatchers.IO) {
+                                fileRepository.getImportedFiles()
+                            }
+                            val pool = mergeByUri(allFiles + imported)
+                            // 完成即复位 isLoading=false：若前一个 loadFiles 在被取消前
+                            // 已将 isLoading 置 true 且未复位（CancellationException 重抛不写标志），
+                            // 这里必须清零，否则空列表场景会永久转圈
+                            partitionAndSet(sortMode, pool, updateLoading = true)
+                        }
                 }
-                .collect { allFiles ->
-                    // 私有目录扫描（filesDir）同步 I/O 放 IO 线程，避免阻塞主线程
-                    val imported = withContext(Dispatchers.IO) {
-                        fileRepository.getImportedFiles()
-                    }
-                    val pool = mergeByUri(allFiles + imported)
-                    partitionAndSet(sortMode, pool, updateLoading = false)
+                // 超时兜底：MediaStore 查询卡死/极慢未返回时释放加载态，避免空列表无限转圈
+                if (completed == null) {
+                    _uiState.update { it.copy(isLoading = false) }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(isLoading = false, errorMessage = "加载文件失败: ${e.message}")
+                }
+            }
         }
     }
 
@@ -151,23 +177,37 @@ class FileListViewModel @Inject constructor(
         loadJob = viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val sortMode = _uiState.value.sortMode
-            fileRepository.getFiles(sortMode)
-                .catch { e ->
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            errorMessage = "加载文件失败: ${e.message}"
-                        )
-                    }
+            try {
+                val completed = withTimeoutOrNull(LOAD_TIMEOUT_MILLIS) {
+                    fileRepository.getFiles(sortMode)
+                        .catch { e ->
+                            _uiState.update {
+                                it.copy(
+                                    isLoading = false,
+                                    errorMessage = "加载文件失败: ${e.message}"
+                                )
+                            }
+                        }
+                        .collect { allFiles ->
+                            // 私有目录扫描（filesDir）同步 I/O 放 IO 线程，避免阻塞主线程
+                            val imported = withContext(Dispatchers.IO) {
+                                fileRepository.getImportedFiles()
+                            }
+                            val pool = mergeByUri(allFiles + imported)
+                            partitionAndSet(sortMode, pool, updateLoading = true)
+                        }
                 }
-                .collect { allFiles ->
-                    // 私有目录扫描（filesDir）同步 I/O 放 IO 线程，避免阻塞主线程
-                    val imported = withContext(Dispatchers.IO) {
-                        fileRepository.getImportedFiles()
-                    }
-                    val pool = mergeByUri(allFiles + imported)
-                    partitionAndSet(sortMode, pool, updateLoading = true)
+                // 超时兜底：MediaStore 查询卡死/极慢未返回时释放加载态，避免空列表无限转圈
+                if (completed == null) {
+                    _uiState.update { it.copy(isLoading = false) }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(isLoading = false, errorMessage = "加载文件失败: ${e.message}")
+                }
+            }
         }
     }
 

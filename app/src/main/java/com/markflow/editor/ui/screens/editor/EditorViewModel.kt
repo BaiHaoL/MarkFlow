@@ -146,6 +146,9 @@ class EditorViewModel @Inject constructor(
     // ==================== 编码 ====================
     /** 手动指定的编码（null = 自动探测）；未手动指定或切文件时重置 */
     private var encodingOverride: Charset? = null
+    /** 当前生效的写回编码：读取时探测或手动指定所得。保存普通文件时按此编码写回，
+     *  避免把 GBK / UTF-16 文件在保存时不可逆转码（对齐分页写回已采用的“探测编码”语义） */
+    private var activeCharset: Charset = Charsets.UTF_8
 
     companion object {
         /** 分页内容内存缓存上限（UTF-16 字符数，≈20MB），超出按 LRU 逐出最旧块，保证内存有界 */
@@ -225,6 +228,10 @@ class EditorViewModel @Inject constructor(
                 // 展示当前编码：优先手动指定，否则自动探测
                 val encName = encodingOverride?.name()
                     ?: withContext(Dispatchers.IO) { fileRepository.detectEncodingName(fileUri) ?: "" }
+                // 记录写回编码：手动指定优先，否则取探测所得（保证保存不转码损坏）
+                activeCharset = encodingOverride
+                    ?: runCatching { Charset.forName(encName) }.getOrNull()
+                    ?: Charsets.UTF_8
                 // TOC 解析在 Default 线程（CPU 密集型）
                 val tocEntries = withContext(Dispatchers.Default) {
                     TocParser.parse(content)
@@ -270,6 +277,8 @@ class EditorViewModel @Inject constructor(
         pagedReader = source
         clearPagedHistory()
         viewModelScope.launch {
+            // 记录写回编码：分页阅读器解析出的字符集（供后续普通文件路径一致使用）
+            activeCharset = runCatching { source.charset() }.getOrNull() ?: Charsets.UTF_8
             val encName = try {
                 source.detectedCharsetName() ?: ""
             } catch (_: Exception) {
@@ -1212,7 +1221,7 @@ class EditorViewModel @Inject constructor(
             try {
                 val content = _uiState.value.currentContent      // 写盘前再读最新值
                 val success = saveMutex.withLock {
-                    fileRepository.saveContent(state.fileUri, content)
+                    fileRepository.saveContent(state.fileUri, content, activeCharset)
                 }
                 if (success) {
                     fileRepository.notifyFileChanged()

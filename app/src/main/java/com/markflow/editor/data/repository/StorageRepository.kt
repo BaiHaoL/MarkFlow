@@ -75,8 +75,16 @@ class StorageRepository @Inject constructor(
         private val MARKDOWN_EXTENSIONS = setOf("md", "markdown")
         /** 图片清理时，超过该字节数的现存 .md 不整载做引用收集（保守保留，防 OOM） */
         private const val MAX_MD_REFERRER_BYTES = 4 * 1024 * 1024
-        /** 本 app 自动生成的图片名（timestamp_random4.jpg，纯 ASCII）；仅此类文件才可被清理回收 */
-        private val REGEX_GENERATED_IMAGE = Regex("""\d+_\d+\.jpg""")
+        /** 本 app 自动生成图片副本的文件名前缀（与历史无前缀格式并存，见 REGEX_GENERATED_IMAGE） */
+        private const val IMAGE_GENERATED_PREFIX = "mf_"
+        /**
+         * 仅匹配本 app 自动生成的图片副本名，防止误删用户资源：
+         * - 新格式（本次起）：`mf_{13位毫秒时间戳}_{4位随机}.jpg`
+         * - 历史格式（本次之前）：`{13位毫秒时间戳}_{4位随机}.jpg`
+         * 13 位毫秒时间戳 + 4 位随机数是我们独有的生成规则，用户常见的 `2024_01.jpg`、
+         * `1_2.jpg` 等命名（位数不符）不会被误判为副本。仅匹配此正则的文件才可被清理回收。
+         */
+        private val REGEX_GENERATED_IMAGE = Regex("""^(?:mf_)?\d{13}_\d{4}\.jpg$""")
         // Markdown 图片引用：![alt](images/xxx.png) ；捕获目标路径
         private val REGEX_MD_IMAGE = Regex("""!\[[^\]]*]\(\s*([^)\s]+)\s*\)""")
         // HTML 图片引用：<img src="images/xxx.png">
@@ -509,14 +517,19 @@ class StorageRepository @Inject constructor(
      *
      * @param uriString 文件 URI
      * @param content 要写入的内容
+     * @param charset 写回编码；默认 UTF-8（original 保持历史行为）。保存普通文件时应传入
+     *   读取时探测/手动指定生效的字符集，避免把 GBK / UTF-16 等非 UTF-8 文件不可逆转码。
      * @return 是否写入成功
      */
-    suspend fun writeFileContent(uriString: String, content: String): Boolean =
-        withContext(Dispatchers.IO) {
+    suspend fun writeFileContent(
+        uriString: String,
+        content: String,
+        charset: Charset = Charsets.UTF_8
+    ): Boolean = withContext(Dispatchers.IO) {
             try {
                 val uri = Uri.parse(uriString)
                 context.contentResolver.openOutputStream(uri, "wt")?.use { outputStream ->
-                    outputStream.write(content.toByteArray(Charsets.UTF_8))
+                    outputStream.write(buildWritePayload(content, charset))
                     outputStream.flush()
                 }
                 true
@@ -525,6 +538,27 @@ class StorageRepository @Inject constructor(
                 false
             }
         }
+
+    /**
+     * 按 [charset] 编码文本为写回字节。
+     *
+     * Java 的 "UTF-16LE"/"UTF-16BE" Charset 编码时**不会**自动加 BOM，而本应用读取时靠
+     * `EncodingDetector` 以 BOM 识别 UTF-16 家族——若不加 BOM 直接回写，下次重新探测会
+     * 把无 BOM 的 UTF-16 误判为 GBK / UTF-8（乱码），造成二次损坏。因此这里对 UTF-16LE/BE
+     * 手动补 BOM；标准 "UTF-16"（大端）其 Charset 自身已带 BOM，不再重复追加。
+     */
+    private fun buildWritePayload(content: String, charset: Charset): ByteArray {
+        val bytes = content.toByteArray(charset)
+        val name = charset.name()
+        val bom = when {
+            name.equals("UTF-16BE", ignoreCase = true) ->
+                byteArrayOf(0xFE.toByte(), 0xFF.toByte())
+            name.equals("UTF-16LE", ignoreCase = true) ->
+                byteArrayOf(0xFF.toByte(), 0xFE.toByte())
+            else -> null
+        }
+        return if (bom != null) bom + bytes else bytes
+    }
 
     // ==================== 图片插入 ====================
 
@@ -544,7 +578,7 @@ class StorageRepository @Inject constructor(
             val decodedJpeg = decodeDownscaledToJpeg(imageUriString)
 
             val imageName =
-                "${System.currentTimeMillis()}_${ThreadLocalRandom.current().nextInt(1000, 10000)}.jpg"
+                "$IMAGE_GENERATED_PREFIX${System.currentTimeMillis()}_${ThreadLocalRandom.current().nextInt(1000, 10000)}.jpg"
             val relativePath = "$IMAGE_ATTACHMENT_DIR/$imageName"
 
             if (mdUri.scheme == "file") {
@@ -1169,8 +1203,10 @@ class StorageRepository @Inject constructor(
         }
 
         // 非法字符检查（Windows / Linux 文件系统保留字符）
+        // 必须对整个 fileName（含扩展名段）校验——仅校验 nameWithoutExt 会让 "evil.a/b"
+        // 这类扩展名段带路径分隔符的名称漏检，导致 File(parent, name) 落入子路径 / 逃逸父目录（H4）
         val invalidChars = setOf('/', '\\', ':', '*', '?', '"', '<', '>', '|')
-        val foundInvalid = nameWithoutExt.firstOrNull { it in invalidChars }
+        val foundInvalid = fileName.firstOrNull { it in invalidChars }
         if (foundInvalid != null) {
             return Result.failure(
                 IllegalArgumentException("文件名包含非法字符: \"$foundInvalid\"")

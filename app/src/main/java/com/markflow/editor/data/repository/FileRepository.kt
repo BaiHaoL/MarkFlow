@@ -7,6 +7,7 @@ import com.markflow.editor.domain.model.MarkdownFile
 import com.markflow.editor.domain.model.SortMode
 import com.markflow.editor.util.RandomSeekReader
 import dagger.hilt.android.qualifiers.ApplicationContext
+import java.nio.charset.Charset
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -78,10 +79,11 @@ class FileRepository @Inject constructor(
     }
 
     /**
-     * 保存文件内容
+     * 保存文件内容（[charset] 为写回编码，默认 UTF-8；普通文件建议传读取时生效的字符集，
+     * 避免把 GBK / UTF-16 文件在保存时不可逆转码）
      */
-    suspend fun saveContent(uri: String, content: String): Boolean {
-        return storageRepository.writeFileContent(uri, content)
+    suspend fun saveContent(uri: String, content: String, charset: Charset = Charsets.UTF_8): Boolean {
+        return storageRepository.writeFileContent(uri, content, charset)
     }
 
     /**

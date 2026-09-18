@@ -154,11 +154,19 @@ class MarkdownSyntaxHighlighter(
         private const val SYNC_THRESHOLD_CHARS = 64_000
 
         /**
-         * 超过该字符数的文档降级高亮：只做核心元素（标题/加粗/斜体/删除线/代码/链接），
-         * 跳过列表标记/引用/分隔线（span 数多、视觉影响小，实测占 23-27%）。
-         * 长文档的 StaticLayout 渲染 span 越少越流畅。
+         * 编辑态富结构降级阈值（非空段落数预算）。
+         *
+         * filter 中「非空段落数 > 本值」的文档直接降级为「仅标题高亮」（不再进本方法）。
+         * 根因：段落数决定 TextParagraph/StaticLayout 数量，富结构（一行一段、塞满列表/引用/
+         * 分隔线）文档在等大字符下可差数倍，且 Relayout/draw 成本随「span 数 × 段落数」增长
+         * ——probe_md_28k（28K，1928 段）真机每帧 Record View#draw 187~258ms，而更长的
+         * Pandas（792 段）反而流畅。故降级按段落数而非字符数触发，普通/小文件保留全量高亮。
+         *
+         * 注意分层叠加：本阈值范围在 EDIT_LIVE_HIGHLIGHT_CHARS(32K) 之内，即「≤32K 且
+         * 段数超预算」走本降级；>32K 已被 EDIT_LIVE_HIGHLIGHT_CHARS 拦截为仅标题。参见
+         * filter 的 gate 顺序。
          */
-        private const val REDUCED_HIGHLIGHT_THRESHOLD = 16_000
+        private const val RICH_PARAGRAPH_BUDGET = 1_500
 
         /**
          * 编辑态实时高亮上限（字符数）：超过该大小的 .md 在编辑模式下不做全量语法高亮，
@@ -168,11 +176,8 @@ class MarkdownSyntaxHighlighter(
          * StaticLayout 全量 relayout，在低内存/中端机（荣耀 X50 骁龙6Gen1 + MagicOS
          * 激进回收）上累积为卡顿或 OOM。Markor 官方对同类问题的解法即「大文件禁高亮」。
          *
-         * 分层（编辑态）：≤REDUCED_HIGHLIGHT_THRESHOLD(16K) 完整 11 种高亮；16K~本值
-         * 降级高亮（7 种核心：标题/加粗/斜体/删除线/代码/链接，跳过列表/引用/分隔线）；
-         * >本值 仅标题高亮。本值取 32_000：让 16K~32K 中型文档保留降级高亮体验，32K
-         * 以上（长文档编辑开销高）才收敛到仅标题。若荣耀 X50 上 16K~32K 仍卡顿，
-         * 可下调到 16_000（=REDUCED_HIGHLIGHT_THRESHOLD）彻底只留标题。
+         * 分层（编辑态）：≤本值 走语法高亮（其中段数 > RICH_PARAGRAPH_BUDGET 的富结构
+         * 文件降级为仅标题）；>本值 仅标题高亮（长文档编辑开销高）。
          *
          * 注意：本值 < SYNC_THRESHOLD_CHARS(64K) 后，filter 内「>本值 被上方拦截直接返回」，
          * 使下方 SYNC 异步分支不可达（dead code），保留作可逆——将来恢复大文档实时高亮，
@@ -274,6 +279,15 @@ class MarkdownSyntaxHighlighter(
             return transformedText(raw, applyHeadingOnlyCached(raw))
         }
 
+        // 富结构降级（方案1止损）：非空段落数超预算的文件（如每行一段、塞满列表/引用/
+        // 分隔线的 markdown）编辑态直接降为「仅标题高亮」。根因（真机 trace 定案）：这类
+        // 文件每段一个 StaticLayout + 数百富 span，每次屏幕失效 Compose 都整篇重录
+        // draw-op，实测 Record View#draw 187~258ms/帧；降级后 span 骤减、绘制骤快，
+        // 代价是失去加粗/代码/链接等富高亮。判据用段数而非字符数（见 RICH_PARAGRAPH_BUDGET）。
+        if (paragraphCountOf(raw) > RICH_PARAGRAPH_BUDGET) {
+            return transformedText(raw, applyHeadingOnlyCached(raw))
+        }
+
         // 阈值内文档：同步计算（首次计算后缓存，后续 filter 调用直接命中缓存）
         if (raw.length <= SYNC_THRESHOLD_CHARS) {
             synchronized(highlightCache) {
@@ -364,14 +378,10 @@ class MarkdownSyntaxHighlighter(
     /**
      * 全量计算语法高亮（同步路径直接调用；异步路径在后台线程调用）。
      *
-     * 优化点：
-     * 1. **去掉全篇基础色 span**：BasicTextField 的 textStyle 已设 onSurface 默认色，
-     *    与 colors.text 基本一致，无需再覆盖全篇。去掉后省一个覆盖全篇的 span，
-     *    减少 StaticLayout 的 span 排序/二分查找开销。
-     * 2. **长文档降级高亮**：超过 [REDUCED_HIGHLIGHT_THRESHOLD] 字符时，只高亮
-     *    对可读性影响最大的核心元素（标题/加粗/斜体/删除线/代码/链接），跳过
-     *    列表标记/引用/分隔线（视觉影响小但 span 数多，实测占 23-27%）。
-     *    长文档的 span 数可从 ~960 降到 ~730，StaticLayout 渲染更流畅。
+     * 仅对「段数 ≤ [RICH_PARAGRAPH_BUDGET]」的文档调用（富结构文件已在 filter 被
+     * 降级为仅标题高亮，不会进入本方法）。注释：已去掉全篇基础色 span——BasicTextField
+     * 的 textStyle 已设 onSurface 默认色，与 colors.text 基本一致，省一个覆盖全篇的
+     * span 可减少 StaticLayout 的 span 排序/二分查找开销。
      */
     private fun computeHighlight(raw: String): AnnotatedString {
         val builder = AnnotatedString.Builder(raw)
@@ -388,15 +398,40 @@ class MarkdownSyntaxHighlighter(
         applyStrikethroughHighlight(raw, builder, fences)
         applyCodeHighlight(raw, builder, fences)
         applyLinkHighlight(raw, builder, fences)
-
-        // 长文档降级：跳过列表/引用/分隔线（span 数多、视觉影响小）
-        if (raw.length <= REDUCED_HIGHLIGHT_THRESHOLD) {
-            applyListHighlight(raw, builder, fences)
-            applyQuoteHighlight(raw, builder, fences)
-            applyRuleHighlight(raw, builder, fences)
-        }
+        applyListHighlight(raw, builder, fences)
+        applyQuoteHighlight(raw, builder, fences)
+        applyRuleHighlight(raw, builder, fences)
 
         return builder.toAnnotatedString()
+    }
+
+    /**
+     * 统计非空段落数（以空行分隔的连续非空行视为多段，纯空白行不计入）。
+     * 单趟 O(n) 字符扫描，不产生 split 数组，成本远低于随后高亮正则，可每次调用。
+     */
+    private fun paragraphCountOf(raw: String): Int {
+        var count = 0
+        var inWord = false // 当前段是否已出现非空白字符
+        var i = 0
+        val n = raw.length
+        while (i < n) {
+            val c = raw[i]
+            when {
+                // 遇到段落分隔即结算当前段
+                c == '\n' || c == '\r' -> {
+                    if (inWord) count++
+                    inWord = false
+                    if (c == '\r' && i + 1 < n && raw[i + 1] == '\n') i++
+                }
+                // 空白不结束段（制表/空格并入当前段）
+                c == ' ' || c == '\t' -> Unit
+                // 首个非空白字符：开始一段
+                else -> inWord = true
+            }
+            i++
+        }
+        if (inWord) count++
+        return count
     }
 
     // ==================== 高亮方法 ====================
