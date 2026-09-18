@@ -2,6 +2,7 @@ package com.markflow.editor.ui.screens.editor
 
 import android.content.Intent
 import android.net.Uri
+import android.view.ViewTreeObserver
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -444,16 +446,33 @@ fun EditorScreen(
                 val editorView = LocalView.current
                 // 一次性垫高上限：防某些时机读到异常大 IME insets 把内容区挤成近 0 高（文本全空白）
                 val keyboardCapPx = with(LocalDensity.current) { 520.dp.roundToPx() }
-                LaunchedEffect(imeVisibleNow) {
-                    if (imeVisibleNow) {
-                        delay(300) // 等键盘动画基本结束，读到稳定高度
-                        // 用 View 的 IME insets 求键盘高度：edge-to-edge 下 getInsets(Type.ime()) 正确
-                        // 反映键盘占用，且非 @Composable 可在协程读取（WindowInsets.ime 在协程会报 @Composable）
-                        val wic = ViewCompat.getRootWindowInsets(editorView)
-                        val raw = wic?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
-                        keyboardBottomPx = raw.coerceIn(0, keyboardCapPx)
-                    } else {
-                        keyboardBottomPx = 0
+                val keyboardScope = rememberCoroutineScope()
+                // IME 高度实时感知（含「可见期间高度变化」，如 拼音⇄手写）：不再只按 imeVisibleNow 翻转一次性
+                // 读取——那样键盘保持可见但高度切换（拼音⇄手写）永远捕获不到，光标会被拔高后的键盘盖住。
+                // 改为监听视图全局布局（IME 显示/高度变化会触发窗口 insets 重排 → 全局布局回调），每次读一次
+                // ime().bottom，settle 防抖（80ms）后一次性提交。只读不消费、不改任何布局：不随键盘动效逐帧
+                // 重组（§5.1 前车之鉴），也不覆盖 Compose 自身的 insets 分发（防连累 navigationBarsPadding 等）。
+                DisposableEffect(editorView) {
+                    var settleJob: Job? = null
+                    val lastCommitted = IntArray(1) // 当前已提交值，避免对同一高度重复提交/回跳
+                    val layoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+                        val raw = (ViewCompat.getRootWindowInsets(editorView)
+                            ?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0)
+                            .coerceIn(0, keyboardCapPx)
+                        settleJob?.cancel()
+                        settleJob = keyboardScope.launch {
+                            delay(80) // 短 settle：高度稳定才提交，防动效中间帧触发重组回跳
+                            if (raw != lastCommitted[0]) {
+                                lastCommitted[0] = raw
+                                keyboardBottomPx = raw
+                            }
+                        }
+                    }
+                    val vto = editorView.viewTreeObserver
+                    vto.addOnGlobalLayoutListener(layoutListener)
+                    onDispose {
+                        settleJob?.cancel()
+                        vto.removeOnGlobalLayoutListener(layoutListener)
                     }
                 }
                 Box(
@@ -1189,21 +1208,39 @@ private fun EditContentView(
                     .fillMaxWidth()
                     // 最小高度铺满可视区：空文件文本仅一行时让点击空白也能聚焦（见上 editAreaHeightPx）
                     .heightIn(min = with(density) { editAreaHeightPx.toDp() })
+                    // 底部留白 + 键盘垫高（2026-09-19 Bug1 修复）：文本贴底无空白的根因是滚动内容
+                    // 无底部留白——末行 curB 贴合视口底、且 v 已达 maxValue，键盘弹出时光标跟随想抬
+                    // 也抬不动(maxValue 钳死)。此 padding 加在滚动内容上：① 让末行下方始终有呼吸空白
+                    // （绝不让 lastDownV=maxValue 的末皮肤光标贴合底部）；② keyboardOffsetPx 追随实时
+                    // 键盘高度，键盘弹起时滚动空间增到≥键盘高，光标可被抬到键盘上方。它只增大
+                    // maxValue、不压缩视口高度，不会触发 §5.1「压缩内容区即空白」陷阱。
+                    .padding(
+                        bottom = with(density) {
+                            (keyboardOffsetPx + 40.dp.roundToPx()).toDp()
+                        }
+                    )
                     .focusRequester(focusRequester)
                     .onFocusChanged { fs ->
                         onFocusChanged(fs.isFocused)
                         // 【首获聚焦跳顶根治】(2026-09-18 真机定案)
                         // 根因：BasicTextField 聚焦 reveal 用「自身滚动 offset=0」判定光标是否可见；
                         // 外层 verticalScroll 已滚动(如 v=11140)且光标在屏外(y≈12164)时，reveal 判定其
-                        // 不可见 → 一步把外层拉到顶(跳顶)，随后键盘 settle 后 cursor-follow 又 scrollTo
-                        // 送回(回弹)。与 setSelection 无关(原生 tap 已证自行落到点按处)。
-                        // 修复：首次聚焦时先把外层滚动对齐到本次点按前的滚动量(lastDownV)，使 reveal
-                        // 判定时光标已在 TextField 自身"可视区"内(近似) → reveal no-op，不再拉外层。
-                        // 跨第一屏点按 / 滚动后点按 / 快速连点均稳定，零跳顶。
+                        // 不可见 → 一步把外层拉到错误位置(观测：末页 8129→2792)，随后我们复位又拉回。
+                        // 与 setSelection 无关(原生 tap 已证自行落到点按处)。
+                        // 修复(2026-09-19)：首次聚焦时立即把外层滚动对齐到本次点按前的滚动量(lastDownV)，
+                        // 使 reveal 判定光标已在可视区(近似) → no-op；并在首帧后再 reconcile 一次，杜绝
+                        // delay(48) 拼时序在主线程忙时输给 reveal 的末页回弹(见下方实现，勿回退成 delay)。
                         if (fs.isFocused && !wasTextFieldFocused) {
                             wasTextFieldFocused = true
                             focusScope.launch {
-                                delay(48)
+                                // 抢在聚焦 reveal 判定前，第一时间把外层滚动对齐到点按前的位置(lastDownV)：
+                                // 原 delay(48) 拼时序在主线程忙(键盘实时监听)时输给 reveal(观测：reveal 落在
+                                // focus+150ms、对齐却晚它 3ms → 先被拉走再拉回 → 末页回弹)。立即复位后，
+                                // reveal 判定光标已在可视区 → no-op，不再拉外层。
+                                scrollState.scrollTo(lastDownV.coerceIn(0, scrollState.maxValue))
+                                // reveal 仍可能在首帧后按过期 offset=0 判定补拉一次外层；等一帧后再
+                                // reconcile 到同一点按位置，即便内部被拉过也归位成同值，用户无感。
+                                withFrameNanos { }
                                 scrollState.scrollTo(lastDownV.coerceIn(0, scrollState.maxValue))
                             }
                         }
@@ -1349,7 +1386,8 @@ private fun EditContentView(
                         // 光标被键盘遮（在安全底边之下）→ 将其底边上移到安全底边再留一点空隙
                         (cursorRect.bottom - safeBottom + safeBottom * 0.1f)
                     }
-                    scrollState.scrollTo(target.coerceIn(0f, scrollState.maxValue.toFloat()).toInt())
+                    val clamped = target.coerceIn(0f, scrollState.maxValue.toFloat()).toInt()
+                    scrollState.scrollTo(clamped)
                 }
             }
         }
