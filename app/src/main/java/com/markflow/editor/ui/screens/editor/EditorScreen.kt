@@ -128,11 +128,16 @@ fun EditorScreen(
     //   故无需再靠"首载聚焦制造可见光标"来防跳顶。）
     val editFocusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
-    // 主编辑框焦点状态：用于「无键盘有光标时按返回键先取消光标、再按才退出文件」。
-    // BackHandler 触发时键盘必已收起（IME 可见时会先消费返回键收键盘），故无需判断 IME 状态。
-    var isEditorFocused by remember { mutableStateOf(false) }
-    val focusManager = LocalFocusManager.current
-
+    // 拦截系统返回键：沉浸全屏中先退出全屏；分段编辑中先取消编辑；否则请求退出文件。
+    // 2026-09-19 移除「无键盘有光标→先清光标再退出」分支：键盘收起已由 EditContentView 的
+    // keyboardWasOpen effect 自动 clearFocus（见其注释），该层正常流程已失效，直接退出更合理。
+    BackHandler {
+        when {
+            uiState.isImmersiveMode -> viewModel.toggleImmersiveMode()
+            uiState.pagedEditingIndex != null -> viewModel.cancelPagedEdit()
+            else -> viewModel.requestNavigateBack { onNavigateBack() }
+        }
+    }
     // 图片选择器：选取图片后写入 .md 同级 images/ 目录并在光标处插入引用
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -166,17 +171,6 @@ fun EditorScreen(
         if (!uiState.isReadOnlyPaged) return@LaunchedEffect
         snapshotFlow { pagedListState.firstVisibleItemIndex }
             .collect { viewModel.onPagedScrollPosition(it) }
-    }
-
-    // 拦截系统返回键：沉浸全屏中先退出全屏；分段编辑中先取消编辑；否则请求退出文件
-    BackHandler {
-        when {
-            uiState.isImmersiveMode -> viewModel.toggleImmersiveMode()
-            uiState.pagedEditingIndex != null -> viewModel.cancelPagedEdit()
-            // 无键盘有光标：先取消光标（失焦），再按返回键才退出文件
-            isEditorFocused -> focusManager.clearFocus()
-            else -> viewModel.requestNavigateBack { onNavigateBack() }
-        }
     }
 
     var textFieldValue by remember { mutableStateOf(TextFieldValue(text = "")) }
@@ -533,7 +527,6 @@ fun EditorScreen(
                                     currentSearchIndex = uiState.currentSearchIndex,
                                     onLayoutResult = { editLayoutResult = it },
                                     focusRequester = editFocusRequester,
-                                    onFocusChanged = { isEditorFocused = it },
                                     keyboardOffsetPx = keyboardBottomPx
                                 )
                             }
@@ -1113,7 +1106,6 @@ private fun EditContentView(
     currentSearchIndex: Int = -1,
     onLayoutResult: (TextLayoutResult) -> Unit = {},
     focusRequester: FocusRequester = remember { FocusRequester() },
-    onFocusChanged: (Boolean) -> Unit = {},
     /** 键盘高度(px)：光标跟随把"安全可见底边"上移到 viewport-top 上方固定偏移，保证光标不被键盘遮挡 */
     keyboardOffsetPx: Int = 0
 ) {
@@ -1177,9 +1169,8 @@ private fun EditContentView(
     // 首次聚焦时先把外层滚动对齐到该处，使聚焦 reveal 判定时光标已在 TextField 自身可视区
     // （近似），reveal no-op 而不再拉外层跳顶。见下方 onFocusChanged 注释。
     var lastDownV by remember { mutableIntStateOf(0) }  // 本次 down 时外层滚动量
-    var wasTextFieldFocused by remember { mutableStateOf(false) }
     // 首获聚焦在 onFocusChanged 回调内（非 suspend，无现成 scope）发起延迟对齐滚动，
-    // 需自建协程 scope；仅首个聚焦回调用一次。
+    // 需自建协程 scope；2026-09-19 二修后每次聚焦 gain 都对齐（见 onFocusChanged 注释）。
     val focusScope = rememberCoroutineScope()
     // 滚动容器可视高度(px)：空文件文本仅一行时，用它给 BasicTextField 设 minHeight 铺满
     // 整屏，使点击首行以下的空白也能落在文本控件上而聚焦；不能用 fillMaxHeight——
@@ -1225,17 +1216,19 @@ private fun EditContentView(
                     )
                     .focusRequester(focusRequester)
                     .onFocusChanged { fs ->
-                        onFocusChanged(fs.isFocused)
                         // 【首获聚焦跳顶根治】(2026-09-18 真机定案)
                         // 根因：BasicTextField 聚焦 reveal 用「自身滚动 offset=0」判定光标是否可见；
                         // 外层 verticalScroll 已滚动(如 v=11140)且光标在屏外(y≈12164)时，reveal 判定其
                         // 不可见 → 一步把外层拉到错误位置(观测：末页 8129→2792)，随后我们复位又拉回。
                         // 与 setSelection 无关(原生 tap 已证自行落到点按处)。
-                        // 修复(2026-09-19)：首次聚焦时立即把外层滚动对齐到本次点按前的滚动量(lastDownV)，
+                        // 修复(2026-09-19)：聚焦时立即把外层滚动对齐到本次点按前的滚动量(lastDownV)，
                         // 使 reveal 判定光标已在可视区(近似) → no-op；并在首帧后再 reconcile 一次，杜绝
                         // delay(48) 拼时序在主线程忙时输给 reveal 的末页回弹(见下方实现，勿回退成 delay)。
-                        if (fs.isFocused && !wasTextFieldFocused) {
-                            wasTextFieldFocused = true
+                        // 2026-09-19 二修：不再用 wasTextFieldFocused 限定"仅首次聚焦"——观测日志实证
+                        // 浏览(失焦)滚动后重新点按聚焦时，reveal 同样会误判拉外层(实例 v=8256→5655 无
+                        // 光标跟随参与)，只守首次聚焦盖不住。改为每次焦点 gain 都对齐，re-focus 同样
+                        // 被护住；已聚焦态下打字移动光标无 focus 事件，不受影响。
+                        if (fs.isFocused) {
                             focusScope.launch {
                                 // 抢在聚焦 reveal 判定前，第一时间把外层滚动对齐到点按前的位置(lastDownV)：
                                 // 原 delay(48) 拼时序在主线程忙(键盘实时监听)时输给 reveal(观测：reveal 落在
@@ -1370,8 +1363,9 @@ private fun EditContentView(
         // 用户 2026-09-19 定案：触发源只认「软键盘从显示→收起」（不动点外部焦点逻辑）；
         // 收起后仅清光标、编辑工具栏（撤销/重做/搜索）保留，不整个退回浏览态。
         // 初始键盘即收起(keyboardOffsetPx=0)不做任何事；仅当曾在键盘开启(>0，含拼音⇄手写
-        // 高度切换，全程 >0 不触发)后收起(=0)才 clearFocus。clearFocus 令 BasicTextField 失焦、
-        // 光标消失，onFocusChanged 同步 isEditorFocused=false，与返回键分层第三层行为一致。
+        // 高度切换，全程 >0 不触发)后收起(=0)才 clearFocus。clearFocus 令 BasicTextField 真正失焦、
+        // 光标消失，进入轻浏览态。返回键分层第三层（isEditorFocused）已于 2026-09-19 移除：
+        // 键盘收起的清光标已由本 effect 统一接管，正常退出不再要求"先返回一次清光标"。
         val focusManager = LocalFocusManager.current
         var keyboardWasOpen by remember { mutableStateOf(false) }
         LaunchedEffect(keyboardOffsetPx) {
@@ -1400,14 +1394,16 @@ private fun EditContentView(
                 val cursorRect = layout.getCursorRect(selection.start)
                 val viewportTop = scrollState.value.toFloat()
                 if (cursorRect.top < viewportTop || cursorRect.bottom > viewportTop + safeBottom) {
+                    // 光标在视口上方 → 滚动到光标行再留 1/3 视口；
+                    // 光标被键盘遮（在安全底边之下）→ 将其底边上移到安全底边再留一点空隙
                     val target = if (cursorRect.top < viewportTop) {
                         (cursorRect.top - viewport / 3f)
                     } else {
-                        // 光标被键盘遮（在安全底边之下）→ 将其底边上移到安全底边再留一点空隙
                         (cursorRect.bottom - safeBottom + safeBottom * 0.1f)
                     }
-                    val clamped = target.coerceIn(0f, scrollState.maxValue.toFloat()).toInt()
-                    scrollState.scrollTo(clamped)
+                    scrollState.scrollTo(
+                        target.coerceIn(0f, scrollState.maxValue.toFloat()).toInt()
+                    )
                 }
             }
         }
