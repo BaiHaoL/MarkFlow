@@ -158,7 +158,7 @@ fun FileListScreen(
                 // 选择模式 TopAppBar：显示已选数量 + 全选 + 退出
                 SelectionTopBar(
                     selectedCount = uiState.selectedFiles.size,
-                    totalCount = uiState.files.size,
+                    totalCount = viewModel.visibleFileCount(),
                     onSelectAll = { viewModel.toggleSelectAll() },
                     onExit = { viewModel.exitSelectionMode() }
                 )

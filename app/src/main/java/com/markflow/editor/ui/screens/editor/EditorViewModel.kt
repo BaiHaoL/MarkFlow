@@ -750,6 +750,9 @@ class EditorViewModel @Inject constructor(
         }
         try {
             temp.outputStream().use { out ->
+                // 保留文件头 BOM：块索引自 bomLength 起、块内不含 BOM，整文件覆写须先补回
+                val bom = reader.bomBytes()
+                if (bom.isNotEmpty()) out.write(bom)
                 var k = 0
                 while (true) {
                     val bytes = if (k == index) newBytes else reader.rawChunkBytes(k)
@@ -889,7 +892,7 @@ class EditorViewModel @Inject constructor(
             try {
                 val content = _uiState.value.currentContent        // 写盘前再读最新值
                 val success = saveMutex.withLock {
-                    fileRepository.saveContent(fileUri, content)
+                    fileRepository.saveContent(fileUri, content, activeCharset)
                 }
                 if (success) {
                     fileRepository.notifyFileChanged()
@@ -928,7 +931,7 @@ class EditorViewModel @Inject constructor(
         try {
             saveMutex.withLock {
                 withContext(Dispatchers.IO) {
-                    fileRepository.saveContent(state.fileUri, state.currentContent)
+                    fileRepository.saveContent(state.fileUri, state.currentContent, activeCharset)
                 }
             }
             fileRepository.notifyFileChanged()

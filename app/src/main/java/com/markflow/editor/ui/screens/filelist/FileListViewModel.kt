@@ -316,6 +316,11 @@ class FileListViewModel @Inject constructor(
         else files.filter { it.fileName.contains(query, ignoreCase = true) }
     }
 
+    /** 当前搜索过滤后的可见文件数。
+     * 该数与 [toggleSelectAll] 的动作口径一致（都作用于过滤后可见子集），供多选
+     * 头「全选/取消全选」标签比较使用——避免用全集造成"已全选可见仍显示全选"的标签/动作相反。 */
+    fun visibleFileCount(): Int = filterFilesByQuery(_uiState.value.files, _uiState.value.searchQuery).size
+
     /** 退出多选模式 */
     fun exitSelectionMode() {
         _uiState.update { it.copy(isSelectionMode = false, selectedFiles = emptySet()) }

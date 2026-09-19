@@ -87,6 +87,34 @@ class PagedTextSource(
     }
 
     /**
+     * 文件头部 BOM 原始字节；无 BOM 或打开失败返回空数组。
+     * 写回（content:// 整文件覆写 [persistContentRewrite]）时须原样保留，
+     * 否则 UTF-16-BOM 大文件分段编辑保存后 BOM 丢失、重开误判编码（与 file://
+     * 原地覆写从 [bomLength] 起、天然保留 BOM 的路径不一致）。
+     */
+    suspend fun bomBytes(): ByteArray = withContext(Dispatchers.IO) {
+        lock.withLock {
+            resolveEncodingLocked()
+            if (bomLength <= 0) return@withLock ByteArray(0)
+            val reader = open() ?: return@withLock ByteArray(0)
+            try {
+                val buf = ByteArray(bomLength)
+                var got = 0
+                var pos = 0L
+                while (got < bomLength) {
+                    val n = reader.read(buf, pos, bomLength - got)
+                    if (n <= 0) break
+                    got += n
+                    pos += n
+                }
+                if (got < bomLength) buf.copyOf(got) else buf
+            } finally {
+                runCatching { reader.close() }
+            }
+        }
+    }
+
+    /**
      * 将全局字节偏移 [byteOffset] 解析为所在块索引（惰性推进索引直至覆盖该偏移）。
      * 用于"恢复阅读位置/书签跳转"：保存编辑只会改变目标块及其之后的字节，
      * 该偏移作为稳定锚点，写回后仍能反查回正确内容。越界/打开失败返回 null。
