@@ -450,7 +450,7 @@ fun EditorScreen(
                 // IME 高度实时感知（含「可见期间高度变化」，如 拼音⇄手写）：不再只按 imeVisibleNow 翻转一次性
                 // 读取——那样键盘保持可见但高度切换（拼音⇄手写）永远捕获不到，光标会被拔高后的键盘盖住。
                 // 改为监听视图全局布局（IME 显示/高度变化会触发窗口 insets 重排 → 全局布局回调），每次读一次
-                // ime().bottom，settle 防抖（80ms）后一次性提交。只读不消费、不改任何布局：不随键盘动效逐帧
+                // ime().bottom，settle 防抖（250ms）后一次性提交。只读不消费、不改任何布局：不随键盘动效逐帧
                 // 重组（§5.1 前车之鉴），也不覆盖 Compose 自身的 insets 分发（防连累 navigationBarsPadding 等）。
                 DisposableEffect(editorView) {
                     var settleJob: Job? = null
@@ -461,7 +461,11 @@ fun EditorScreen(
                             .coerceIn(0, keyboardCapPx)
                         settleJob?.cancel()
                         settleJob = keyboardScope.launch {
-                            delay(80) // 短 settle：高度稳定才提交，防动效中间帧触发重组回跳
+                            // settle 死区 250ms：键盘启动/高度切换动画（~100-300ms，且事件常呈爆发式
+                            // 间断）期间即使 >80ms 无布局事件仍会在中间高度提交一次，光标跟随以
+                            // keyboardOffsetPx 为 key 会先抬再落形成小幅上下抽动（2026-09-19 偶发实证）。
+                            // 拉长到覆盖动画间歇，使键盘高度只提交一次「稳定终值」→ 单次抬升、无回摆。
+                            delay(250)
                             if (raw != lastCommitted[0]) {
                                 lastCommitted[0] = raw
                                 keyboardBottomPx = raw
@@ -1360,6 +1364,22 @@ private fun EditContentView(
             } else if (wasSearchActive) {
                 // 刚关闭搜索：保持锁定，直到用户编辑/移动光标（见 editTextFieldValueChange）
                 wasSearchActive = false
+            }
+        }
+        // 键盘「显示→收起」跃迁时清除光标，真正失焦（≠仅隐藏），进轻浏览态。
+        // 用户 2026-09-19 定案：触发源只认「软键盘从显示→收起」（不动点外部焦点逻辑）；
+        // 收起后仅清光标、编辑工具栏（撤销/重做/搜索）保留，不整个退回浏览态。
+        // 初始键盘即收起(keyboardOffsetPx=0)不做任何事；仅当曾在键盘开启(>0，含拼音⇄手写
+        // 高度切换，全程 >0 不触发)后收起(=0)才 clearFocus。clearFocus 令 BasicTextField 失焦、
+        // 光标消失，onFocusChanged 同步 isEditorFocused=false，与返回键分层第三层行为一致。
+        val focusManager = LocalFocusManager.current
+        var keyboardWasOpen by remember { mutableStateOf(false) }
+        LaunchedEffect(keyboardOffsetPx) {
+            if (keyboardOffsetPx > 0) {
+                keyboardWasOpen = true
+            } else if (keyboardWasOpen) {
+                keyboardWasOpen = false
+                focusManager.clearFocus()
             }
         }
         // 键盘开启时，把"安全可见底边"上移 keyboardOffsetPx，光标跟随将光标所在行抬到键盘上方，
