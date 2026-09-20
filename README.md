@@ -1,5 +1,9 @@
 # MarkFlow
 
+<div align="left">
+<b>中文</b> · <a href="README.en.md">English</a>
+</div>
+
 Markdown 编辑器，专为 Android 设计。支持 Markdown 及多种文本文件的浏览、编辑、预览与管理，提供流畅的写作体验。
 
 ## 功能特性
