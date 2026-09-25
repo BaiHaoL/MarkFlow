@@ -4,6 +4,7 @@ import android.content.IntentSender
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import java.io.File
 import com.markflow.editor.data.local.PreferencesManager
 import com.markflow.editor.data.repository.FileRepository
 import com.markflow.editor.domain.model.MarkdownFile
@@ -471,6 +472,27 @@ class FileListViewModel @Inject constructor(
         if (pending.isNotEmpty()) doRename(pending)
     }
 
+    /**
+     * 推导重命名成功后的 uri：file:// 路径重命名会改变 uri（StorageRepository.renameFileOnDisk 用
+     * `File(parentDir, fullNewName)` + renameTo），需按新文件名在旧父目录下重建，与列表 key
+     * （`Uri.fromFile(file)`）对齐；content:// 原地 update DISPLAY_NAME，uri 不变，直接返回原 uri。
+     * @param newName 必须为 `renameFile` 落盘的最终文件名（内部已 `trim()`，故调用方须传 `newName.trim()`）
+     */
+    private fun resolveRenamedUri(oldUri: String, newName: String): String {
+        return try {
+            val uri = Uri.parse(oldUri)
+            if (uri.scheme.equals("file", ignoreCase = true)) {
+                val oldFile = File(uri.path ?: return oldUri)
+                val parent = oldFile.parentFile ?: return oldUri
+                Uri.fromFile(File(parent, newName)).toString()
+            } else {
+                oldUri
+            }
+        } catch (_: Exception) {
+            oldUri
+        }
+    }
+
     fun dismissRenameConfirm() {
         _uiState.update { it.copy(showRenameConfirmDialog = false, pendingRenameName = "") }
     }
@@ -485,6 +507,10 @@ class FileListViewModel @Inject constructor(
             val result = fileRepository.renameFile(uri, newName)
             result.fold(
                 onSuccess = {
+                    // 重命名成功后迁移星标/最近打开 key：file:// 路径重命名会改变 uri，
+                    // 需把旧 uri 的星标/最近项搬移到新 uri；content:// 原地 update 不改 uri，传同名即 no-op。
+                    val newUri = resolveRenamedUri(uri, newName.trim())
+                    preferencesManager.migrateUri(uri, newUri)
                     _uiState.update {
                         it.copy(
                             isRenaming = false,

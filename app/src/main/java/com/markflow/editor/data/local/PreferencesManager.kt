@@ -137,6 +137,29 @@ class PreferencesManager @Inject constructor(
         prefs.edit().putStringSet(KEY_STARRED_URIS, current).apply()
     }
 
+    /**
+     * 重命名成功后将文件的星标与「最近打开」状态从旧 uri 迁移到新 uri。
+     * 仅 file:// 路径（私有导入文件）重命名会改变 uri，content:// 原地 update 不变化、
+     * 无需迁移（uri 相同时本方法为无操作）。oldUri == newUri 或均未命中时不做任何写盘。
+     */
+    fun migrateUri(oldUri: String, newUri: String) {
+        if (oldUri == newUri) return
+        // 星标
+        val stars = getStarredUris().toMutableSet()
+        if (oldUri in stars) {
+            stars.remove(oldUri)
+            stars.add(newUri)
+            prefs.edit().putStringSet(KEY_STARRED_URIS, stars).apply()
+        }
+        // 最近打开队列
+        val recents = getRecentUris().toMutableList()
+        val idx = recents.indexOf(oldUri)
+        if (idx >= 0) {
+            recents[idx] = newUri
+            persistRecentUris(recents)
+        }
+    }
+
     // ==================== 最近打开队列（「最近打开」分区，FIFO 有界队列） ====================
 
     /**

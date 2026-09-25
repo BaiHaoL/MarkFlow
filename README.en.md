@@ -1,7 +1,7 @@
 # MarkFlow
 
 <div align="left">
-[中文](README.md) · <b>English</b>
+<b>English</b> · <a href="README.md">中文</a>
 </div>
 
 A Markdown editor designed for Android. It supports browsing, editing, previewing, and managing Markdown and a variety of text files, delivering a fluid writing experience.

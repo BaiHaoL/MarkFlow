@@ -528,9 +528,11 @@ class StorageRepository @Inject constructor(
     ): Boolean = withContext(Dispatchers.IO) {
             try {
                 val uri = Uri.parse(uriString)
-                context.contentResolver.openOutputStream(uri, "wt")?.use { outputStream ->
-                    outputStream.write(buildWritePayload(content, charset))
-                    outputStream.flush()
+                val outputStream = context.contentResolver.openOutputStream(uri, "wt")
+                    ?: return@withContext false
+                outputStream.use {
+                    it.write(buildWritePayload(content, charset))
+                    it.flush()
                 }
                 true
             } catch (e: Exception) {
