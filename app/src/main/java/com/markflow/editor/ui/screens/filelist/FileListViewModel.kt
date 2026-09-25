@@ -474,9 +474,14 @@ class FileListViewModel @Inject constructor(
 
     /**
      * 推导重命名成功后的 uri：file:// 路径重命名会改变 uri（StorageRepository.renameFileOnDisk 用
-     * `File(parentDir, fullNewName)` + renameTo），需按新文件名在旧父目录下重建，与列表 key
-     * （`Uri.fromFile(file)`）对齐；content:// 原地 update DISPLAY_NAME，uri 不变，直接返回原 uri。
+     * `File(parentDir, fullNewName)` + renameTo），需按新文件名在旧父目录下重建，与列表 key 对齐；
+     * content:// 原地 update DISPLAY_NAME（_ID 不变），uri 不变，直接返回原 uri。
      * @param newName 必须为 `renameFile` 落盘的最终文件名（内部已 `trim()`，故调用方须传 `newName.trim()`）
+     *
+     * ⚠️ file:// 重建必须用 `File.toURI()`（而非 `Uri.fromFile`）：列表 file:// 的 key 由
+     * `scanImportedFiles` 的 `child.toURI().toString()` 构造，`Uri.fromFile` 不百分号编码——对
+     * 中文/空格/`#` 等文件名，两种形式的 uri 字符串不一致（toURI 含 `%E4%B8%AD` 编码、fromFile 原样），
+     * 迁移到 fromFile 形式会与新扫描 key 匹配不上 → 星标/最近项仍丢失。toURI 与磁盘 key 严格一致。
      */
     private fun resolveRenamedUri(oldUri: String, newName: String): String {
         return try {
@@ -484,7 +489,7 @@ class FileListViewModel @Inject constructor(
             if (uri.scheme.equals("file", ignoreCase = true)) {
                 val oldFile = File(uri.path ?: return oldUri)
                 val parent = oldFile.parentFile ?: return oldUri
-                Uri.fromFile(File(parent, newName)).toString()
+                File(parent, newName).toURI().toString()
             } else {
                 oldUri
             }
